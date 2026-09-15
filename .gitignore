@@ -1,0 +1,16 @@
+# Runtime and local data
+backend/dispatch.db
+*.db-journal
+
+# Build and dependency output
+**/node_modules/
+**/dist/
+
+# Local environment and logs
+.env
+.env.*
+*.log
+
+# Python bytecode
+**/__pycache__/
+*.py[cod]
