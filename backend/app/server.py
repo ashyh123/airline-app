@@ -316,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send({"tasks": self._driver_tasks(db, user["vehicle_id"])})
                     return
                 if path == "/api/admin/flights":
-                    self._authorize(db, "ADMIN")
+                    self._authorize(db, "DISPATCHER")
                     self._send({"flights": rows(db, "SELECT * FROM flights ORDER BY departure_at")})
                     return
             self._send({"error": "未找到资源"}, HTTPStatus.NOT_FOUND)
@@ -354,11 +354,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._resolve_alert(db, path.split("/")[3], payload)
                     return
                 if path == "/api/admin/flights/import":
-                    self._authorize(db, "ADMIN")
+                    self._authorize(db, "DISPATCHER")
                     self._import_flights(db, payload)
                     return
                 if path == "/api/admin/broadcasts":
-                    user = self._authorize(db, "ADMIN")
+                    user = self._authorize(db, "DISPATCHER")
                     self._create_broadcast(db, payload, user)
                     return
             self._send({"error": "未找到资源"}, HTTPStatus.NOT_FOUND)
@@ -400,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
         return rows(
             db,
             """SELECT t.id, t.state, t.eta_minutes, t.updated_at, f.flight_no, f.gate,
-                      f.fuel_needed, f.priority, v.code vehicle_code
+                      f.fuel_needed, f.priority, v.code vehicle_code, v.fuel_level, v.capacity
                FROM tasks t JOIN flights f ON f.id=t.flight_id JOIN vehicles v ON v.id=t.vehicle_id
                WHERE t.vehicle_id=? AND t.state NOT IN ('COMPLETED','CANCELLED')
                ORDER BY f.priority DESC, f.departure_at ASC""",
@@ -445,10 +445,25 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"不允许从 {task['state']} 变更为 {state}")
         if state == "EXCEPTION" and not reason.strip():
             raise ValueError("异常上报必须填写原因")
+        reported_fuel = None
+        if state == "COMPLETED":
+            vehicle = db.execute("SELECT capacity FROM vehicles WHERE id=?", (task["vehicle_id"],)).fetchone()
+            try:
+                reported_fuel = int(payload.get("fuelLevel"))
+            except (TypeError, ValueError):
+                raise ValueError("完成作业时必须提交有效的当前油量")
+            if not 0 <= reported_fuel <= vehicle["capacity"]:
+                raise ValueError(f"当前油量应在 0 至 {vehicle['capacity']} 升之间")
         db.execute("UPDATE tasks SET state=?, updated_at=? WHERE id=?", (state, now(), task_id))
         if state in {"COMPLETED", "EXCEPTION"}:
             vehicle_status = "AVAILABLE" if state == "COMPLETED" else "MAINTENANCE"
-            db.execute("UPDATE vehicles SET status=?, updated_at=? WHERE id=?", (vehicle_status, now(), task["vehicle_id"]))
+            if reported_fuel is None:
+                db.execute("UPDATE vehicles SET status=?, updated_at=? WHERE id=?", (vehicle_status, now(), task["vehicle_id"]))
+            else:
+                db.execute(
+                    "UPDATE vehicles SET status=?, fuel_level=?, updated_at=? WHERE id=?",
+                    (vehicle_status, reported_fuel, now(), task["vehicle_id"]),
+                )
             db.execute("UPDATE flights SET status=? WHERE id=(SELECT flight_id FROM tasks WHERE id=?)", ("COMPLETED" if state == "COMPLETED" else "WAITING", task_id))
             if state == "EXCEPTION":
                 message = f"工单异常：{reason}"
@@ -584,7 +599,7 @@ class Handler(BaseHTTPRequestHandler):
         broadcast(
             db, "INFO", "航班计划已导入",
             f"已导入或更新 {imported} 条航班计划{f'，其中 {len(rejected)} 条数据格式异常' if rejected else ''}。",
-            source="ADMIN_IMPORT",
+            source="DISPATCH_IMPORT",
         )
         self._send({"message": f"已导入或更新 {imported} 条航班数据", "imported": imported, "rejected": rejected, "flights": rows(db, "SELECT * FROM flights ORDER BY departure_at")})
 
@@ -599,7 +614,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("播报级别不合法")
         if flight_id and not db.execute("SELECT 1 FROM flights WHERE id=?", (flight_id,)).fetchone():
             raise ValueError("关联航班不存在")
-        broadcast(db, level, title, content, flight_id, f"ADMIN:{user['display_name']}")
+        broadcast(db, level, title, content, flight_id, f"DISPATCHER:{user['display_name']}")
         self._send({"message": "现场情况已发送至调度员运行通知", "overview": overview(db)})
 
 

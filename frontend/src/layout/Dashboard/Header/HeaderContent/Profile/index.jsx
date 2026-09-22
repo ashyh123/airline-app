@@ -23,6 +23,9 @@ import MainCard from 'components/MainCard';
 import Transitions from 'components/@extended/Transitions';
 import IconButton from 'components/@extended/IconButton';
 
+import { useNavigate } from 'react-router-dom';
+import { clearUser, currentUser } from 'utils/auth';
+
 // assets
 import LogoutOutlined from '@ant-design/icons/LogoutOutlined';
 import SettingOutlined from '@ant-design/icons/SettingOutlined';
@@ -49,6 +52,16 @@ function a11yProps(index) {
 
 export default function Profile() {
   const theme = useTheme();
+  const navigate = useNavigate();
+  const user = currentUser();
+
+  const roleLabel = { DISPATCHER: '调度人员', DRIVER: '加油人员', ADMIN: '系统管理员' }[user?.role] ?? '';
+
+  function handleLogout() {
+    clearUser();
+    setOpen(false);
+    navigate('/login', { replace: true });
+  }
 
   const anchorRef = useRef(null);
   const [open, setOpen] = useState(false);
@@ -115,14 +128,14 @@ export default function Profile() {
                       <Stack direction="row" sx={{ gap: 1.25, alignItems: 'center' }}>
                         <Avatar alt="profile user" src={avatar1} sx={{ width: 32, height: 32 }} />
                         <Stack>
-                          <Typography variant="h6">John Doe</Typography>
+                          <Typography variant="h6">{user?.display_name ?? '未登录'}</Typography>
                           <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                            UI/UX Designer
+                            {roleLabel}
                           </Typography>
                         </Stack>
                       </Stack>
-                      <Tooltip title="Logout">
-                        <IconButton size="large" sx={{ color: 'text.primary' }}>
+                      <Tooltip title="退出登录">
+                        <IconButton size="large" sx={{ color: 'text.primary' }} onClick={handleLogout}>
                           <LogoutOutlined />
                         </IconButton>
                       </Tooltip>
