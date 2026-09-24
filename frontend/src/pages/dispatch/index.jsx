@@ -33,6 +33,7 @@ import {
   ImportOutlined,
   NotificationOutlined,
   ProfileOutlined,
+  TeamOutlined,
   WarningOutlined
 } from '@ant-design/icons';
 import { apiHeaders, currentUser } from 'utils/auth';
@@ -51,6 +52,12 @@ const stateStyle = {
   MAINTENANCE: ['维修中', 'default']
 };
 
+const workStyle = {
+  ON_DUTY: ['值班', 'success'],
+  STANDBY: ['休闲', 'info'],
+  RESTING: ['休息', 'default']
+};
+
 const SECTIONS = [
   { id: 'overview', label: '态势总览', icon: <DashboardOutlined /> },
   { id: 'map', label: '机坪态势', icon: <EnvironmentOutlined /> },
@@ -58,6 +65,7 @@ const SECTIONS = [
   { id: 'timeline', label: '任务时间轴', icon: <FieldTimeOutlined /> },
   { id: 'tasks', label: '作业工单', icon: <ProfileOutlined /> },
   { id: 'resources', label: '资源与指标', icon: <CarOutlined /> },
+  { id: 'personnel', label: '当班人员', icon: <TeamOutlined /> },
   { id: 'import', label: '航班导入', icon: <ImportOutlined /> },
   { id: 'broadcast', label: '现场播报', icon: <NotificationOutlined /> }
 ];
@@ -80,10 +88,6 @@ function Metric({ label, value, note, tone = 'primary' }) {
       <Typography variant="caption" color="text.secondary">{note}</Typography>
     </Paper>
   );
-}
-
-function ApiError({ message }) {
-  return message ? <Alert severity="error" sx={{ mb: 2 }}>{message}</Alert> : null;
 }
 
 const mapX = (x) => 50 + x * 38;
@@ -197,12 +201,20 @@ export default function DispatchConsole() {
   const [broadcastContent, setBroadcastContent] = useState('');
   const [broadcastLevel, setBroadcastLevel] = useState('INFO');
   const [broadcastFlight, setBroadcastFlight] = useState('');
+  const [personnelFilter, setPersonnelFilter] = useState('');
+  const [callTarget, setCallTarget] = useState(null);
+  const [callVehicleId, setCallVehicleId] = useState('');
+  const [statusTarget, setStatusTarget] = useState(null);
+  const [statusReason, setStatusReason] = useState('');
+  const [personActing, setPersonActing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
 
   const load = useCallback(async () => {
     try {
       const response = await fetch(`${API}/overview`, { headers: apiHeaders() });
       if (!response.ok) throw new Error('调度服务暂不可用，请确认后端已启动。');
       setData(await response.json());
+      setLastUpdated(new Date());
       setError('');
     } catch (err) {
       setError(err.message);
@@ -212,6 +224,11 @@ export default function DispatchConsole() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, [load]);
 
   async function command(path, payload = {}) {
     const response = await fetch(`${API}${path}`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(payload) });
@@ -285,6 +302,31 @@ export default function DispatchConsole() {
     document.getElementById(`section-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
+  async function personAction(path, payload) {
+    setPersonActing(true);
+    try {
+      await command(path, payload);
+      setCallTarget(null); setCallVehicleId('');
+      setStatusTarget(null); setStatusReason('');
+    } catch (err) { setError(err.message); } finally { setPersonActing(false); }
+  }
+
+  function openCall(person) {
+    setCallTarget(person);
+    setCallVehicleId('');
+  }
+
+  function openStatus(person, status) {
+    setStatusTarget({ person, status });
+    setStatusReason('');
+  }
+
+  const boundVehicleIds = new Set((data?.personnel ?? []).filter((p) => p.vehicle_id).map((p) => p.vehicle_id));
+  const freeVehicles = (data?.vehicles ?? []).filter((vehicle) => vehicle.status === 'AVAILABLE' && !boundVehicleIds.has(vehicle.id));
+  const filteredDrivers = (data?.personnel ?? []).filter((person) => person.role === 'DRIVER' && (!personnelFilter || person.work_status === personnelFilter));
+  const dispatchers = (data?.personnel ?? []).filter((person) => person.role === 'DISPATCHER');
+  const counts = data?.personnelCounts ?? { onDuty: 0, standby: 0, resting: 0 };
+
   if (loading) return <Box sx={{ display: 'grid', placeItems: 'center', minHeight: 360 }}><CircularProgress /></Box>;
 
   return (
@@ -305,7 +347,7 @@ export default function DispatchConsole() {
         <Box sx={{ display: 'flex', alignItems: { xs: 'start', sm: 'center' }, justifyContent: 'space-between', gap: 2, flexDirection: { xs: 'column', sm: 'row' } }}>
           <Box>
             <Typography variant="h4">调度人员工作台</Typography>
-            <Typography color="text.secondary" sx={{ mt: 0.5 }}>{currentUser()?.display_name}</Typography>
+            <Typography color="text.secondary" sx={{ mt: 0.5 }}>{currentUser()?.display_name}{lastUpdated ? ` · 最后更新 ${lastUpdated.toLocaleTimeString('zh-CN', { hour12: false })}` : ''}</Typography>
           </Box>
           <Stack direction="row" spacing={1}>
             <Button variant="outlined" onClick={load}>刷新态势</Button>
@@ -313,7 +355,7 @@ export default function DispatchConsole() {
           </Stack>
         </Box>
 
-        <ApiError message={error} />
+        {error && <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" size="small" onClick={load}>重试</Button>}>{error}</Alert>}
         {message && <Alert severity="success" onClose={() => setMessage('')}>{message}</Alert>}
 
         {data && <>
@@ -360,6 +402,50 @@ export default function DispatchConsole() {
             <Grid id="section-resources" size={{ xs: 12, lg: 7 }} sx={{ scrollMarginTop: '88px' }}><Paper variant="outlined" sx={{ p: 2.25 }}><Typography variant="h6" mb={1.5}>加油车资源</Typography><Stack spacing={1.5}>{data.vehicles.map((vehicle) => <Box key={vehicle.id}><Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}><Typography variant="body2" fontWeight={600}>{vehicle.code} <Typography component="span" variant="caption" color="text.secondary">· {vehicle.driver}</Typography></Typography><Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}><Typography variant="caption">{vehicle.fuel_level.toLocaleString()} / {vehicle.capacity.toLocaleString()} L</Typography><StateChip value={vehicle.status} /></Stack></Stack><LinearProgress variant="determinate" value={Math.round(vehicle.fuel_level / vehicle.capacity * 100)} color={vehicle.fuel_level / vehicle.capacity < .35 ? 'warning' : 'primary'} /></Box>)}</Stack></Paper></Grid>
             <Grid size={{ xs: 12, lg: 5 }}><Paper variant="outlined" sx={{ p: 2.25, height: '100%' }}><Typography variant="h6">运行指标</Typography><Stack spacing={2} mt={2}><Box><Stack direction="row" sx={{ justifyContent: 'space-between' }}><Typography variant="body2">按时保障率</Typography><Typography variant="body2" fontWeight={700}>{data.stats.onTimeRate}%</Typography></Stack><LinearProgress variant="determinate" value={data.stats.onTimeRate} color="success" sx={{ mt: 0.75 }} /></Box></Stack></Paper></Grid>
           </Grid>
+
+          <Paper id="section-personnel" variant="outlined" sx={{ p: 2.25, scrollMarginTop: '88px' }}>
+            <Stack direction="row" sx={{ justifyContent: 'space-between', alignItems: 'center', mb: 1.5, flexWrap: 'wrap', gap: 1 }}>
+              <Box>
+                <Typography variant="h6">人员与可调度资源</Typography>
+                <Typography variant="caption" color="text.secondary">值班与休闲人员可被临时调用；休息人员不参与派工。</Typography>
+              </Box>
+              <Stack direction="row" spacing={1}>
+                {[['', '全部'], ['ON_DUTY', `值班 ${counts.onDuty}`], ['STANDBY', `休闲 ${counts.standby}`], ['RESTING', `休息 ${counts.resting}`]].map(([value, label]) => (
+                  <Chip key={value} size="small" clickable variant={personnelFilter === value ? 'filled' : 'outlined'} color={value === 'ON_DUTY' ? 'success' : value === 'STANDBY' ? 'info' : 'default'} label={label} onClick={() => setPersonnelFilter(value)} />
+                ))}
+              </Stack>
+            </Stack>
+            <Box sx={{ mb: 1.5 }}>
+              <Typography variant="caption" color="text.secondary">调度人员：</Typography>
+              {dispatchers.map((dispatcher) => <Chip key={dispatcher.id} size="small" sx={{ mr: 0.75 }} label={`${dispatcher.display_name}（${dispatcher.username}）`} />)}
+            </Box>
+            <Table size="small" sx={{ minWidth: 720 }}>
+              <TableHead><TableRow><TableCell>工号</TableCell><TableCell>姓名</TableCell><TableCell>账号</TableCell><TableCell>状态</TableCell><TableCell>负责车辆</TableCell><TableCell>当前任务</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
+              <TableBody>
+                {filteredDrivers.map((person) => {
+                  const [workLabel, workColor] = workStyle[person.work_status] ?? [person.work_status ?? '—', 'default'];
+                  return <TableRow key={person.id} hover>
+                    <TableCell>{person.emp_no ?? '—'}</TableCell>
+                    <TableCell><Typography fontWeight={600}>{person.display_name}</Typography></TableCell>
+                    <TableCell>{person.username}</TableCell>
+                    <TableCell><Chip size="small" label={workLabel} color={workColor} variant={workColor === 'default' ? 'outlined' : 'filled'} /></TableCell>
+                    <TableCell>{person.vehicle_code ? <>{person.vehicle_code} <Typography component="span" variant="caption" color="text.secondary">（{stateStyle[person.vehicle_status]?.[0] ?? person.vehicle_status}）</Typography></> : '—'}</TableCell>
+                    <TableCell>{person.current_task ? <>{person.current_task.flight_no} · {person.current_task.gate} <Chip size="small" variant="outlined" label={stateStyle[person.current_task.state]?.[0]} color={stateStyle[person.current_task.state]?.[1]} /></> : '—'}</TableCell>
+                    <TableCell align="right">
+                      <Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end' }}>
+                        {person.work_status === 'RESTING' && <Button size="small" variant="outlined" onClick={() => openStatus(person, 'STANDBY')}>设为休闲</Button>}
+                        {person.work_status === 'STANDBY' && <Button size="small" variant="contained" onClick={() => openCall(person)}>临时调用</Button>}
+                        {person.work_status === 'ON_DUTY' && <Button size="small" variant="contained" onClick={() => openCall(person)}>更换车辆</Button>}
+                        {person.work_status === 'ON_DUTY' && <Button size="small" variant="outlined" onClick={() => openStatus(person, 'STANDBY')}>设为休闲</Button>}
+                        {(person.work_status === 'ON_DUTY' || person.work_status === 'STANDBY') && <Button size="small" variant="outlined" color="warning" onClick={() => openStatus(person, 'RESTING')}>安排休息</Button>}
+                      </Stack>
+                    </TableCell>
+                  </TableRow>;
+                })}
+                {filteredDrivers.length === 0 && <TableRow><TableCell colSpan={7}><Typography color="text.secondary" sx={{ py: 2 }}>该状态下暂无人员</Typography></TableCell></TableRow>}
+              </TableBody>
+            </Table>
+          </Paper>
 
           <Paper id="section-import" variant="outlined" sx={{ p: 2.25, scrollMarginTop: '88px' }}>
             <Typography variant="h6">导入航班数据</Typography>
@@ -410,6 +496,47 @@ export default function DispatchConsole() {
           </Stack>}
         </DialogContent>
         <DialogActions><Button onClick={() => setHandlingAlert(null)} disabled={resolvingAlert}>取消</Button><Button variant="contained" onClick={resolveAlert} disabled={handlingAlert?.loading || resolutionNote.trim().length < 4 || resolvingAlert}>{resolvingAlert ? '归档中…' : '确认处置并归档'}</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={Boolean(callTarget)} onClose={() => !personActing && setCallTarget(null)} fullWidth maxWidth="xs">
+        <DialogTitle>{callTarget?.work_status === 'ON_DUTY' ? '更换负责车辆' : '临时调用'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              {callTarget?.work_status === 'ON_DUTY'
+                ? `${callTarget?.display_name} 当前负责 ${callTarget?.vehicle_code ?? '无车辆'}。更换后原车辆解除绑定；名下有待执行或作业中工单时无法更换。`
+                : `为 ${callTarget?.display_name} 选择一辆可用且未被占用的加油车，确认后人员转为值班并建立车辆绑定。`}
+            </Typography>
+            {freeVehicles.length === 0 ? <Alert severity="warning">当前没有可用且未被占用的加油车，无法临时调用。</Alert> : (
+              <Select aria-label="选择加油车" fullWidth value={callVehicleId} onChange={(event) => setCallVehicleId(event.target.value)} displayEmpty>
+                <MenuItem value="">请选择加油车</MenuItem>
+                {freeVehicles.map((vehicle) => <MenuItem key={vehicle.id} value={vehicle.id}>{vehicle.code} · 油量 {vehicle.fuel_level.toLocaleString()} / {vehicle.capacity.toLocaleString()} L</MenuItem>)}
+              </Select>
+            )}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCallTarget(null)} disabled={personActing}>取消</Button>
+          <Button variant="contained" disabled={!callVehicleId || personActing} onClick={() => personAction(`/dispatch/personnel/${callTarget.id}/${callTarget.work_status === 'ON_DUTY' ? 'vehicle' : 'call'}`, { vehicleId: callVehicleId })}>{personActing ? '处理中…' : '确认'}</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={Boolean(statusTarget)} onClose={() => !personActing && setStatusTarget(null)} fullWidth maxWidth="xs">
+        <DialogTitle>{statusTarget?.status === 'RESTING' ? '安排休息' : '设为休闲'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              {statusTarget?.status === 'RESTING'
+                ? `${statusTarget?.person?.display_name} 将移出可调度队伍并解除车辆绑定；名下有待执行或作业中工单时将被阻止。`
+                : `${statusTarget?.person?.display_name} 将进入候命状态${statusTarget?.person?.work_status === 'ON_DUTY' ? '，并解除当前车辆绑定' : ''}，可再次被临时调用或直接派工。`}
+            </Typography>
+            <TextField autoFocus label="原因" value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="如：交班、请假、临时离岗" helperText={statusTarget?.status === 'RESTING' ? '必填，供交接班追溯' : '值班人员转休闲时必填'} />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setStatusTarget(null)} disabled={personActing}>取消</Button>
+          <Button variant="contained" disabled={personActing || (statusTarget?.status === 'RESTING' && statusReason.trim().length < 2) || (statusTarget?.status === 'STANDBY' && statusTarget?.person?.work_status === 'ON_DUTY' && statusReason.trim().length < 2)} onClick={() => personAction(`/dispatch/personnel/${statusTarget.person.id}/status`, { status: statusTarget.status, reason: statusReason })}>{personActing ? '处理中…' : '确认'}</Button>
+        </DialogActions>
       </Dialog>
     </Box>
   );

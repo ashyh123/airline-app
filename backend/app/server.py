@@ -9,15 +9,19 @@ plugged in for a production deployment.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +45,56 @@ def connect() -> sqlite3.Connection:
     return connection
 
 
+WORK_STATUSES = {"ON_DUTY": "值班", "STANDBY": "休闲", "RESTING": "休息"}
+PASSWORD_ITERATIONS = 120_000
+
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    if not stored:
+        return False
+    try:
+        _, salt_hex, digest_hex = stored.split("$")
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), PASSWORD_ITERATIONS)
+        return hmac.compare_digest(candidate.hex(), digest_hex)
+    except (ValueError, AttributeError):
+        return False
+
+
+def generate_password() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    return "Fuel@" + "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+def check_password_strength(password: str) -> None:
+    if not 8 <= len(password) <= 64:
+        raise ValueError("密码长度应为 8 至 64 位")
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        raise ValueError("密码需同时包含字母和数字")
+
+
+def log_operation(
+    db: sqlite3.Connection, actor: sqlite3.Row | dict | None, action: str,
+    target_type: str = "", target_id: str = "", target_name: str = "",
+    before: str = "", after: str = "", reason: str = "", result: str = "成功",
+) -> None:
+    actor_id = actor["id"] if actor else ""
+    actor_name = actor["display_name"] if actor else "系统"
+    db.execute(
+        """INSERT INTO operation_logs
+           (id, actor_id, actor_name, action, target_type, target_id, target_name,
+            before_state, after_state, reason, result, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (str(uuid.uuid4()), actor_id, actor_name, action, target_type, target_id, target_name,
+         before, after, reason, result, now()),
+    )
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flights (
   id TEXT PRIMARY KEY, flight_no TEXT NOT NULL, gate TEXT NOT NULL,
@@ -56,7 +110,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, flight_id TEXT NOT NULL REFERENCES flights(id),
   vehicle_id TEXT REFERENCES vehicles(id), state TEXT NOT NULL, locked INTEGER NOT NULL DEFAULT 0,
   eta_minutes INTEGER, dispatch_order INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, assigned_driver TEXT
 );
 CREATE TABLE IF NOT EXISTS alerts (
   id TEXT PRIMARY KEY, level TEXT NOT NULL, type TEXT NOT NULL, message TEXT NOT NULL,
@@ -73,7 +127,16 @@ CREATE TABLE IF NOT EXISTS broadcasts (
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
   display_name TEXT NOT NULL, role TEXT NOT NULL,
-  vehicle_id TEXT REFERENCES vehicles(id)
+  vehicle_id TEXT REFERENCES vehicles(id),
+  emp_no TEXT, phone TEXT, account_status TEXT NOT NULL DEFAULT 'ENABLED',
+  work_status TEXT, password_hash TEXT, must_change INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS operation_logs (
+  id TEXT PRIMARY KEY, actor_id TEXT, actor_name TEXT, action TEXT NOT NULL,
+  target_type TEXT, target_id TEXT, target_name TEXT,
+  before_state TEXT, after_state TEXT, reason TEXT, result TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
@@ -93,11 +156,43 @@ def init_db() -> None:
         task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
         if "dispatch_order" not in task_columns:
             db.execute("ALTER TABLE tasks ADD COLUMN dispatch_order INTEGER NOT NULL DEFAULT 0")
+        if "assigned_driver" not in task_columns:
+            db.execute("ALTER TABLE tasks ADD COLUMN assigned_driver TEXT")
+            db.execute(
+                "UPDATE tasks SET assigned_driver="
+                "(SELECT driver FROM vehicles WHERE vehicles.id = tasks.vehicle_id) "
+                "WHERE assigned_driver IS NULL"
+            )
         alert_columns = {row["name"] for row in db.execute("PRAGMA table_info(alerts)")}
         if "resolution" not in alert_columns:
             db.execute("ALTER TABLE alerts ADD COLUMN resolution TEXT")
         if "resolved_at" not in alert_columns:
             db.execute("ALTER TABLE alerts ADD COLUMN resolved_at TEXT")
+        # Personnel & account management columns (FR-01/FR-02).
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        for column, ddl in {
+            "emp_no": "ALTER TABLE users ADD COLUMN emp_no TEXT",
+            "phone": "ALTER TABLE users ADD COLUMN phone TEXT",
+            "account_status": "ALTER TABLE users ADD COLUMN account_status TEXT NOT NULL DEFAULT 'ENABLED'",
+            "work_status": "ALTER TABLE users ADD COLUMN work_status TEXT",
+            "password_hash": "ALTER TABLE users ADD COLUMN password_hash TEXT",
+            "must_change": "ALTER TABLE users ADD COLUMN must_change INTEGER NOT NULL DEFAULT 0",
+            "created_at": "ALTER TABLE users ADD COLUMN created_at TEXT",
+        }.items():
+            if column not in user_columns:
+                db.execute(ddl)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vehicle "
+            "ON users(vehicle_id) WHERE vehicle_id IS NOT NULL"
+        )
+        # Migrate legacy plaintext passwords into PBKDF2 hashes (FR-02.4).
+        for item in db.execute("SELECT id, password, password_hash FROM users"):
+            if not item["password_hash"]:
+                db.execute(
+                    "UPDATE users SET password_hash=? WHERE id=?",
+                    (hash_password(item["password"]), item["id"]),
+                )
+        db.execute("UPDATE users SET created_at=? WHERE created_at IS NULL", (now(),))
         if not db.execute("SELECT COUNT(*) FROM flights").fetchone()[0]:
             flights = [
                 ("f1", "CA1832", "B12", "2026-09-14T09:45:00+00:00", 7200, 3, "WAITING", 12, 8),
@@ -121,15 +216,20 @@ def init_db() -> None:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 ("t-seeded", "f3", "v3", "IN_PROGRESS", 0, 8, 0, now(), now()),
             )
+        seeded_users = [
+            ("dispatcher", "dispatch01", "dispatch123", "张宁", "DISPATCHER", None, "D001", None),
+            ("admin", "admin01", "admin123", "系统管理员", "ADMIN", None, "A001", None),
+            ("driver-v1", "driver01", "driver123", "李昊", "DRIVER", "v1", "V001", "ON_DUTY"),
+            ("driver-v2", "driver02", "driver123", "周敏", "DRIVER", "v2", "V002", "ON_DUTY"),
+            ("driver-v3", "driver03", "driver123", "陈跃", "DRIVER", "v3", "V003", "ON_DUTY"),
+        ]
         db.executemany(
-            "INSERT OR IGNORE INTO users (id, username, password, display_name, role, vehicle_id) VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                ("dispatcher", "dispatch01", "dispatch123", "张宁", "DISPATCHER", None),
-                ("admin", "admin01", "admin123", "系统管理员", "ADMIN", None),
-                ("driver-v1", "driver01", "driver123", "李昊", "DRIVER", "v1"),
-                ("driver-v2", "driver02", "driver123", "周敏", "DRIVER", "v2"),
-                ("driver-v3", "driver03", "driver123", "陈跃", "DRIVER", "v3"),
-            ],
+            """INSERT OR IGNORE INTO users
+               (id, username, password, display_name, role, vehicle_id, emp_no, phone,
+                account_status, work_status, password_hash, must_change, created_at)
+               VALUES (?, ?, '', ?, ?, ?, ?, NULL, 'ENABLED', ?, ?, 0, ?)""",
+            [(uid, uname, name, role, veh, emp, work, hash_password(pwd), now())
+             for uid, uname, pwd, name, role, veh, emp, work in seeded_users],
         )
         db.executemany(
             "UPDATE users SET username=?, password=? WHERE id=?",
@@ -139,6 +239,16 @@ def init_db() -> None:
                 ("driver03", "driver123", "driver-v3"),
             ],
         )
+        # Backfill personnel metadata for databases created before this feature.
+        db.executemany(
+            "UPDATE users SET emp_no=?, work_status=? WHERE id=? AND emp_no IS NULL",
+            [(emp, work, uid) for uid, _u, _p, _n, _r, _v, emp, work in seeded_users],
+        )
+        for driver_user, name in (("driver-v1", "李昊"), ("driver-v2", "周敏"), ("driver-v3", "陈跃")):
+            db.execute(
+                "UPDATE vehicles SET driver=? WHERE id=(SELECT vehicle_id FROM users WHERE id=?) AND (driver IS NULL OR driver='')",
+                (name, driver_user),
+            )
         # Give pre-existing prototype tasks an initial visible queue order once.
         # Later restarts preserve all manually adjusted orders.
         pending = rows(
@@ -198,7 +308,13 @@ class Scheduler:
                (SELECT 1 FROM tasks t WHERE t.flight_id=f.id AND t.state IN ('PENDING','IN_PROGRESS'))
                ORDER BY f.priority DESC, f.departure_at ASC""",
         )
-        fleet = rows(db, "SELECT * FROM vehicles WHERE status = 'AVAILABLE' ORDER BY code")
+        fleet = rows(
+            db,
+            """SELECT v.*, u.id driver_user_id, u.display_name driver_name, u.emp_no driver_emp_no
+               FROM vehicles v JOIN users u ON u.vehicle_id = v.id
+               WHERE v.status = 'AVAILABLE' AND u.work_status = 'ON_DUTY' AND u.account_status = 'ENABLED'
+               ORDER BY v.code""",
+        )
         assignments, risks = [], []
         for flight in waiting:
             eligible = [vehicle for vehicle in fleet if vehicle["fuel_level"] >= flight["fuel_needed"]]
@@ -220,9 +336,9 @@ class Scheduler:
             ).fetchone()[0]
             db.execute(
                 """INSERT INTO tasks
-                   (id, flight_id, vehicle_id, state, locked, eta_minutes, dispatch_order, created_at, updated_at)
-                   VALUES (?, ?, ?, 'PENDING', 0, ?, ?, ?, ?)""",
-                (task_id, flight["id"], vehicle["id"], eta, next_order, now(), now()),
+                   (id, flight_id, vehicle_id, state, locked, eta_minutes, dispatch_order, created_at, updated_at, assigned_driver)
+                   VALUES (?, ?, ?, 'PENDING', 0, ?, ?, ?, ?, ?)""",
+                (task_id, flight["id"], vehicle["id"], eta, next_order, now(), now(), vehicle["driver_name"]),
             )
             db.execute("UPDATE flights SET status='ASSIGNED' WHERE id=?", (flight["id"],))
             db.execute(
@@ -237,7 +353,7 @@ class Scheduler:
 def overview(db: sqlite3.Connection) -> dict:
     active = rows(
         db,
-        """SELECT t.id, t.state, t.locked, t.eta_minutes, t.dispatch_order, t.updated_at,
+        """SELECT t.id, t.state, t.locked, t.eta_minutes, t.dispatch_order, t.updated_at, t.assigned_driver,
                   f.id flight_id, f.flight_no, f.gate, f.departure_at, f.fuel_needed, f.priority,
                   v.id vehicle_id, v.code vehicle_code, v.driver
            FROM tasks t JOIN flights f ON f.id=t.flight_id
@@ -264,9 +380,35 @@ def overview(db: sqlite3.Connection) -> dict:
         """SELECT * FROM alerts WHERE resolved=1 AND resolved_at IS NOT NULL
            ORDER BY resolved_at DESC LIMIT 5""",
     )
+    personnel = rows(
+        db,
+        """SELECT u.id, u.emp_no, u.username, u.display_name, u.role, u.work_status,
+                  u.account_status, u.vehicle_id, u.phone, u.created_at,
+                  v.code vehicle_code, v.status vehicle_status
+           FROM users u LEFT JOIN vehicles v ON v.id = u.vehicle_id
+           WHERE u.role IN ('DISPATCHER', 'DRIVER') AND u.account_status = 'ENABLED'
+           ORDER BY CASE u.role WHEN 'DISPATCHER' THEN 0 ELSE 1 END, u.emp_no""",
+    )
+    for member in personnel:
+        member["current_task"] = None
+        if member["role"] == "DRIVER" and member["vehicle_id"]:
+            member["current_task"] = db.execute(
+                """SELECT t.state, f.flight_no, f.gate FROM tasks t JOIN flights f ON f.id = t.flight_id
+                   WHERE t.vehicle_id = ? AND t.state IN ('PENDING', 'IN_PROGRESS')
+                   ORDER BY CASE t.state WHEN 'IN_PROGRESS' THEN 0 ELSE 1 END,
+                            CASE WHEN t.dispatch_order = 0 THEN 999999 ELSE t.dispatch_order END
+                   LIMIT 1""",
+                (member["vehicle_id"],),
+            ).fetchone()
+    personnel_counts = {
+        "onDuty": sum(p["role"] == "DRIVER" and p["work_status"] == "ON_DUTY" for p in personnel),
+        "standby": sum(p["role"] == "DRIVER" and p["work_status"] == "STANDBY" for p in personnel),
+        "resting": sum(p["role"] == "DRIVER" and p["work_status"] == "RESTING" for p in personnel),
+    }
     return {
         "stats": stats, "tasks": active, "vehicles": vehicles, "flights": flights,
         "alerts": alerts, "broadcasts": broadcasts, "recentResolutions": recent_resolutions,
+        "personnel": personnel, "personnelCounts": personnel_counts,
     }
 
 
@@ -313,11 +455,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if path == "/api/driver/tasks":
                     user = self._authorize(db, "DRIVER")
-                    self._send({"tasks": self._driver_tasks(db, user["vehicle_id"])})
+                    self._send(self._driver_tasks(db, user))
                     return
                 if path == "/api/admin/flights":
                     self._authorize(db, "DISPATCHER")
                     self._send({"flights": rows(db, "SELECT * FROM flights ORDER BY departure_at")})
+                    return
+                if path == "/api/admin/personnel":
+                    self._authorize(db, "ADMIN")
+                    params = parse_qs(urlparse(self.path).query)
+                    self._send({"personnel": self._list_personnel(db, params)})
                     return
             self._send({"error": "未找到资源"}, HTTPStatus.NOT_FOUND)
         except PermissionError as exc:
@@ -361,6 +508,44 @@ class Handler(BaseHTTPRequestHandler):
                     user = self._authorize(db, "DISPATCHER")
                     self._create_broadcast(db, payload, user)
                     return
+                if path == "/api/auth/change-password":
+                    user = self._authorize(db, "DISPATCHER", "DRIVER", "ADMIN")
+                    self._change_password(db, payload, user)
+                    return
+                if path == "/api/admin/personnel":
+                    user = self._authorize(db, "ADMIN")
+                    self._create_personnel(db, payload, user)
+                    return
+                if path.startswith("/api/admin/personnel/"):
+                    user = self._authorize(db, "ADMIN")
+                    parts = path.split("/")
+                    person_id = parts[4]
+                    action = parts[5] if len(parts) > 5 else ""
+                    if action == "reset-password":
+                        self._reset_password(db, person_id, user)
+                    elif action == "disable":
+                        self._set_account_status(db, person_id, False, user)
+                    elif action == "enable":
+                        self._set_account_status(db, person_id, True, user)
+                    elif action == "profile":
+                        self._update_personnel(db, person_id, payload, user)
+                    else:
+                        self._send({"error": "未找到资源"}, HTTPStatus.NOT_FOUND)
+                    return
+                if path.startswith("/api/dispatch/personnel/"):
+                    actor = self._authorize(db, "DISPATCHER")
+                    parts = path.split("/")
+                    person_id = parts[4]
+                    action = parts[5] if len(parts) > 5 else ""
+                    if action == "status":
+                        self._set_work_status(db, person_id, payload, actor)
+                    elif action == "call":
+                        self._call_driver(db, person_id, payload, actor)
+                    elif action == "vehicle":
+                        self._rebind_driver_vehicle(db, person_id, payload, actor)
+                    else:
+                        self._send({"error": "未找到资源"}, HTTPStatus.NOT_FOUND)
+                    return
             self._send({"error": "未找到资源"}, HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             self._send({"error": str(exc)}, HTTPStatus.UNPROCESSABLE_ENTITY)
@@ -378,34 +563,71 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchone()
         if not token or not user or user["role"] not in roles:
             raise PermissionError("当前角色无权执行此操作，请重新登录。")
+        if user["account_status"] != "ENABLED":
+            raise PermissionError("账号已被停用，请联系系统管理员。")
         return user
 
     def _login(self, db: sqlite3.Connection, payload: dict) -> None:
         username, password = str(payload.get("username", "")).strip(), payload.get("password")
-        user = db.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password)).fetchone()
-        if not user:
+        user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if not user or not verify_password(str(password or ""), user["password_hash"]):
             raise ValueError("账号或密码错误")
+        if user["account_status"] != "ENABLED":
+            raise ValueError("账号已被停用，请联系系统管理员")
         token = str(uuid.uuid4())
         db.execute("INSERT INTO sessions VALUES (?, ?, ?)", (token, user["id"], now()))
         self._send({"user": self._public_user(user, token), "message": "登录成功"})
+
+    def _change_password(self, db: sqlite3.Connection, payload: dict, user: sqlite3.Row) -> None:
+        old_password = str(payload.get("oldPassword", ""))
+        new_password = str(payload.get("newPassword", ""))
+        fresh = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not verify_password(old_password, fresh["password_hash"]):
+            raise ValueError("初始密码不正确")
+        check_password_strength(new_password)
+        db.execute(
+            "UPDATE users SET password_hash=?, must_change=0 WHERE id=?",
+            (hash_password(new_password), user["id"]),
+        )
+        log_operation(db, fresh, "修改密码", "人员账号", fresh["id"], fresh["display_name"])
+        self._send({"message": "密码已更新，请使用新密码登录", "user": self._public_user(fresh)})
 
     @staticmethod
     def _public_user(user: sqlite3.Row, token: str | None = None) -> dict:
         return {
             "id": user["id"], "username": user["username"], "display_name": user["display_name"],
-            "role": user["role"], "vehicle_id": user["vehicle_id"], **({"token": token} if token else {}),
+            "role": user["role"], "vehicle_id": user["vehicle_id"], "emp_no": user["emp_no"],
+            "work_status": user["work_status"], "must_change": bool(user["must_change"]),
+            **({"token": token} if token else {}),
         }
 
-    def _driver_tasks(self, db: sqlite3.Connection, vehicle_id: str) -> list[dict]:
-        return rows(
+    def _driver_tasks(self, db: sqlite3.Connection, user: sqlite3.Row) -> dict:
+        vehicle = None
+        if user["vehicle_id"]:
+            vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (user["vehicle_id"],)).fetchone()
+        eligible = (
+            user["account_status"] == "ENABLED"
+            and user["work_status"] == "ON_DUTY"
+            and vehicle is not None
+        )
+        tasks = rows(
             db,
             """SELECT t.id, t.state, t.eta_minutes, t.updated_at, f.flight_no, f.gate,
                       f.fuel_needed, f.priority, v.code vehicle_code, v.fuel_level, v.capacity
                FROM tasks t JOIN flights f ON f.id=t.flight_id JOIN vehicles v ON v.id=t.vehicle_id
                WHERE t.vehicle_id=? AND t.state NOT IN ('COMPLETED','CANCELLED')
                ORDER BY f.priority DESC, f.departure_at ASC""",
-            (vehicle_id,),
-        )
+            (user["vehicle_id"],),
+        ) if eligible else []
+        return {
+            "tasks": tasks,
+            "driver": {
+                "work_status": user["work_status"],
+                "account_status": user["account_status"],
+                "vehicle": dict(vehicle) if vehicle else None,
+                "eligible": eligible,
+            },
+        }
 
     def _event(self, db: sqlite3.Connection, payload: dict) -> None:
         event_id = payload.get("eventId") or self.headers.get("Idempotency-Key")
@@ -441,6 +663,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("工单不存在")
         if task["vehicle_id"] != user["vehicle_id"]:
             raise PermissionError("只能更新分配给自己的工单")
+        if user["account_status"] != "ENABLED" or user["work_status"] != "ON_DUTY":
+            raise PermissionError("当前账号状态不允许操作工单，请联系调度人员或系统管理员")
         if state not in TASK_TRANSITIONS.get(task["state"], set()):
             raise ValueError(f"不允许从 {task['state']} 变更为 {state}")
         if state == "EXCEPTION" and not reason.strip():
@@ -487,6 +711,13 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("该车辆当前不可改派")
         if vehicle["fuel_level"] < task["fuel_needed"]:
             raise ValueError("该车辆油量不足，无法改派")
+        driver = db.execute(
+            """SELECT u.display_name FROM users u
+               WHERE u.vehicle_id=? AND u.work_status='ON_DUTY' AND u.account_status='ENABLED'""",
+            (vehicle_id,),
+        ).fetchone()
+        if not driver:
+            raise ValueError("该车辆没有值班加油人员负责，无法改派")
         try:
             eta = int(eta_minutes)
             requested_order = int(dispatch_order)
@@ -497,8 +728,8 @@ class Handler(BaseHTTPRequestHandler):
         if requested_order < 1:
             raise ValueError("执行顺序必须从 1 开始")
         db.execute(
-            "UPDATE tasks SET vehicle_id=?, eta_minutes=?, locked=1, updated_at=? WHERE id=?",
-            (vehicle_id, eta, now(), task_id),
+            "UPDATE tasks SET vehicle_id=?, eta_minutes=?, locked=1, updated_at=?, assigned_driver=? WHERE id=?",
+            (vehicle_id, eta, now(), driver["display_name"], task_id),
         )
         self._resequence_tasks(db, task_id, requested_order)
         db.execute("UPDATE vehicles SET status='RESERVED', updated_at=? WHERE id=?", (now(), vehicle_id))
@@ -520,9 +751,12 @@ class Handler(BaseHTTPRequestHandler):
         if flight:
             candidate_rows = rows(
                 db,
-                """SELECT * FROM vehicles WHERE fuel_level >= ? AND status != 'MAINTENANCE'
-                   ORDER BY CASE status WHEN 'AVAILABLE' THEN 0 WHEN 'RESERVED' THEN 1 ELSE 2 END,
-                            fuel_level DESC""",
+                """SELECT v.* FROM vehicles v
+                   JOIN users u ON u.vehicle_id = v.id
+                   WHERE v.fuel_level >= ? AND v.status != 'MAINTENANCE'
+                     AND u.work_status = 'ON_DUTY' AND u.account_status = 'ENABLED'
+                   ORDER BY CASE v.status WHEN 'AVAILABLE' THEN 0 WHEN 'RESERVED' THEN 1 ELSE 2 END,
+                            v.fuel_level DESC""",
                 (flight["fuel_needed"],),
             )
             for vehicle in candidate_rows:
@@ -616,6 +850,229 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("关联航班不存在")
         broadcast(db, level, title, content, flight_id, f"DISPATCHER:{user['display_name']}")
         self._send({"message": "现场情况已发送至调度员运行通知", "overview": overview(db)})
+
+    # ---------------- 人员与账号管理（FR-01 / FR-02，仅系统管理员） ----------------
+
+    def _list_personnel(self, db: sqlite3.Connection, params: dict) -> list[dict]:
+        conditions, args = ["u.role IN ('DISPATCHER', 'DRIVER')"], []
+        role = params.get("role", [""])[0]
+        if role in {"DISPATCHER", "DRIVER"}:
+            conditions.append("u.role=?"); args.append(role)
+        status = params.get("status", [""])[0]
+        if status in {"ENABLED", "DISABLED"}:
+            conditions.append("u.account_status=?"); args.append(status)
+        work = params.get("work", [""])[0]
+        if work in WORK_STATUSES:
+            conditions.append("u.work_status=?"); args.append(work)
+        keyword = params.get("q", [""])[0].strip()
+        if keyword:
+            conditions.append("(u.emp_no LIKE ? OR u.display_name LIKE ? OR u.username LIKE ?)")
+            args.extend([f"%{keyword}%"] * 3)
+        return rows(
+            db,
+            f"""SELECT u.id, u.emp_no, u.username, u.display_name, u.role, u.phone,
+                       u.account_status, u.work_status, u.created_at, u.vehicle_id,
+                       v.code vehicle_code, v.status vehicle_status
+                FROM users u LEFT JOIN vehicles v ON v.id = u.vehicle_id
+                WHERE {" AND ".join(conditions)}
+                ORDER BY CASE u.role WHEN 'DISPATCHER' THEN 0 ELSE 1 END, u.emp_no""",
+            tuple(args),
+        )
+
+    def _personnel_target(self, db: sqlite3.Connection, person_id: str) -> sqlite3.Row:
+        target = db.execute("SELECT * FROM users WHERE id=?", (person_id,)).fetchone()
+        if not target or target["role"] not in {"DISPATCHER", "DRIVER"}:
+            raise ValueError("人员不存在")
+        return target
+
+    def _create_personnel(self, db: sqlite3.Connection, payload: dict, admin: sqlite3.Row) -> None:
+        role = str(payload.get("role", "")).upper()
+        emp_no = str(payload.get("empNo", "")).strip()
+        name = str(payload.get("name", "")).strip()
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        phone = str(payload.get("phone", "")).strip()
+        if role not in {"DISPATCHER", "DRIVER"}:
+            raise ValueError("角色必须为调度人员或加油人员")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{2,20}", emp_no):
+            raise ValueError("工号应为 2 至 20 位字母、数字、下划线或短横线")
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+            raise ValueError("登录账号应为 3 至 20 位字母、数字或下划线")
+        if not 2 <= len(name) <= 20:
+            raise ValueError("姓名应为 2 至 20 个字")
+        check_password_strength(password)
+        if db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            raise ValueError("登录账号已存在")
+        if db.execute("SELECT 1 FROM users WHERE emp_no=?", (emp_no,)).fetchone():
+            raise ValueError("工号已存在")
+        person_id = f"user-{uuid.uuid4()}"
+        db.execute(
+            """INSERT INTO users
+               (id, username, password, display_name, role, vehicle_id, emp_no, phone,
+                account_status, work_status, password_hash, must_change, created_at)
+               VALUES (?, ?, '', ?, ?, NULL, ?, ?, 'ENABLED', ?, ?, 1, ?)""",
+            (person_id, username, name, role, emp_no, phone or None,
+             "RESTING" if role == "DRIVER" else None, hash_password(password), now()),
+        )
+        role_label = "调度人员" if role == "DISPATCHER" else "加油人员"
+        log_operation(db, admin, "创建人员账号", "人员账号", person_id, name,
+                      after=f"角色={role_label} 工号={emp_no} 账号={username}")
+        self._send({
+            "message": f"已创建{role_label}账号 {username}，初始密码仅本次显示，请交付本人并提醒首次登录修改",
+            "personnel": dict(self._personnel_target(db, person_id)),
+        })
+
+    def _update_personnel(self, db: sqlite3.Connection, person_id: str, payload: dict, admin: sqlite3.Row) -> None:
+        target = self._personnel_target(db, person_id)
+        name = str(payload.get("name", target["display_name"])).strip()
+        phone = str(payload.get("phone", target["phone"] or "")).strip()
+        if not 2 <= len(name) <= 20:
+            raise ValueError("姓名应为 2 至 20 个字")
+        db.execute("UPDATE users SET display_name=?, phone=? WHERE id=?", (name, phone or None, person_id))
+        log_operation(db, admin, "修改人员资料", "人员账号", person_id, name,
+                      before=target["display_name"], after=name)
+        self._send({"message": "人员资料已更新", "personnel": dict(self._personnel_target(db, person_id))})
+
+    def _reset_password(self, db: sqlite3.Connection, person_id: str, admin: sqlite3.Row) -> None:
+        target = self._personnel_target(db, person_id)
+        new_password = generate_password()
+        db.execute("UPDATE users SET password_hash=?, must_change=1 WHERE id=?", (hash_password(new_password), person_id))
+        db.execute("DELETE FROM sessions WHERE user_id=?", (person_id,))
+        log_operation(db, admin, "重置密码", "人员账号", person_id, target["display_name"])
+        self._send({"message": "密码已重置，新密码仅本次显示，请交付本人并提醒首次登录修改", "password": new_password})
+
+    def _active_vehicle_tasks(self, db: sqlite3.Connection, vehicle_id: str | None, *states: str) -> list[dict]:
+        if not vehicle_id or not states:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        return rows(db, f"SELECT id, state FROM tasks WHERE vehicle_id=? AND state IN ({placeholders})", (vehicle_id, *states))
+
+    def _set_account_status(self, db: sqlite3.Connection, person_id: str, enabled: bool, admin: sqlite3.Row) -> None:
+        target = self._personnel_target(db, person_id)
+        if not enabled and person_id == admin["id"]:
+            raise ValueError("不能停用当前登录的管理员账号")
+        if enabled:
+            if target["account_status"] == "ENABLED":
+                self._send({"message": "账号已处于启用状态"}); return
+            db.execute("UPDATE users SET account_status='ENABLED' WHERE id=?", (person_id,))
+            log_operation(db, admin, "启用账号", "人员账号", person_id, target["display_name"])
+            self._send({"message": "账号已启用", "overview": overview(db)}); return
+        if target["account_status"] == "DISABLED":
+            self._send({"message": "账号已处于停用状态"}); return
+        active = self._active_vehicle_tasks(db, target["vehicle_id"], "PENDING", "IN_PROGRESS")
+        if active:
+            raise ValueError("该人员名下有待执行或作业中工单，请先由调度人员完成交接后再停用")
+        before = f"账号=ENABLED 状态={WORK_STATUSES.get(target['work_status']) or '无'} 车辆={target['vehicle_id'] or '无'}"
+        if target["vehicle_id"]:
+            db.execute("UPDATE vehicles SET driver='', updated_at=? WHERE id=?", (now(), target["vehicle_id"]))
+        db.execute(
+            "UPDATE users SET account_status='DISABLED', work_status='RESTING', vehicle_id=NULL WHERE id=?",
+            (person_id,),
+        )
+        db.execute("DELETE FROM sessions WHERE user_id=?", (person_id,))
+        log_operation(db, admin, "停用账号", "人员账号", person_id, target["display_name"],
+                      before=before, after="账号=DISABLED 状态=休息 车辆=无")
+        self._send({"message": "账号已停用，已有会话立即失效", "overview": overview(db)})
+
+    # ---------------- 可调度队伍与临时调用（FR-04 / FR-05，仅调度人员） ----------------
+
+    def _driver_target(self, db: sqlite3.Connection, person_id: str) -> sqlite3.Row:
+        target = self._personnel_target(db, person_id)
+        if target["role"] != "DRIVER":
+            raise ValueError("只能操作加油人员")
+        if target["account_status"] != "ENABLED":
+            raise ValueError("该人员账号已停用")
+        return target
+
+    def _bound_vehicle_code(self, db: sqlite3.Connection, vehicle_id: str | None) -> str:
+        if not vehicle_id:
+            return "无"
+        row = db.execute("SELECT code FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+        return row["code"] if row else "无"
+
+    def _unbind_vehicle(self, db: sqlite3.Connection, driver: sqlite3.Row) -> None:
+        if not driver["vehicle_id"]:
+            return
+        db.execute("UPDATE users SET vehicle_id=NULL WHERE id=?", (driver["id"],))
+        db.execute("UPDATE vehicles SET driver='', updated_at=? WHERE id=?", (now(), driver["vehicle_id"]))
+
+    def _free_vehicle(self, db: sqlite3.Connection, vehicle_id: str | None) -> sqlite3.Row:
+        if not vehicle_id:
+            raise ValueError("请选择要绑定的加油车")
+        vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+        if not vehicle:
+            raise ValueError("加油车不存在")
+        if vehicle["status"] != "AVAILABLE":
+            raise ValueError(f"车辆 {vehicle['code']} 当前不可用")
+        occupied = db.execute(
+            "SELECT display_name FROM users WHERE vehicle_id=? AND account_status='ENABLED'", (vehicle_id,)
+        ).fetchone()
+        if occupied:
+            raise ValueError(f"车辆 {vehicle['code']} 已被 {occupied['display_name']} 占用")
+        return vehicle
+
+    def _set_work_status(self, db: sqlite3.Connection, person_id: str, payload: dict, actor: sqlite3.Row) -> None:
+        target_status = str(payload.get("status", "")).upper()
+        reason = str(payload.get("reason", "")).strip()
+        if target_status not in WORK_STATUSES:
+            raise ValueError("工作状态必须为值班、休闲或休息")
+        driver = self._driver_target(db, person_id)
+        current = driver["work_status"]
+        before = f"状态={WORK_STATUSES.get(current) or '无'} 车辆={self._bound_vehicle_code(db, driver['vehicle_id'])}"
+        if current == target_status:
+            self._send({"message": f"人员已处于{WORK_STATUSES[target_status]}状态", "overview": overview(db)}); return
+        if target_status == "ON_DUTY":
+            raise ValueError("转为值班必须通过临时调用并绑定车辆")
+        active = self._active_vehicle_tasks(db, driver["vehicle_id"], "PENDING", "IN_PROGRESS")
+        if active:
+            raise ValueError("该人员名下有待执行或作业中工单，请先完成作业、改派或按异常流程处理")
+        if target_status == "RESTING" and len(reason) < 2:
+            raise ValueError("请填写状态变更原因（如交班、请假、临时离岗）")
+        if current == "ON_DUTY" and target_status == "STANDBY" and len(reason) < 2:
+            raise ValueError("请填写设为休闲的原因")
+        self._unbind_vehicle(db, driver)
+        db.execute("UPDATE users SET work_status=? WHERE id=?", (target_status, person_id))
+        log_operation(db, actor, "调整工作状态", "加油人员", person_id, driver["display_name"],
+                      before=before, after=f"状态={WORK_STATUSES[target_status]} 车辆=无", reason=reason)
+        self._send({"message": f"{driver['display_name']} 已调整为{WORK_STATUSES[target_status]}", "overview": overview(db)})
+
+    def _call_driver(self, db: sqlite3.Connection, person_id: str, payload: dict, actor: sqlite3.Row) -> None:
+        driver = self._driver_target(db, person_id)
+        if driver["work_status"] == "ON_DUTY":
+            raise ValueError("该人员已在值班并负责车辆，如需派工请使用工单微调")
+        if driver["work_status"] == "RESTING":
+            raise ValueError("休息人员不能临时调用，请先将人员调整为休闲候命")
+        vehicle = self._free_vehicle(db, payload.get("vehicleId"))
+        try:
+            db.execute(
+                "UPDATE users SET vehicle_id=?, work_status='ON_DUTY' WHERE id=?",
+                (vehicle["id"], person_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"车辆 {vehicle['code']} 刚被其他值班人员占用，请重新选择") from exc
+        db.execute("UPDATE vehicles SET driver=?, updated_at=? WHERE id=?", (driver["display_name"], now(), vehicle["id"]))
+        log_operation(db, actor, "临时调用", "加油人员", person_id, driver["display_name"],
+                      before="状态=休闲 车辆=无", after=f"状态=值班 车辆={vehicle['code']}")
+        self._send({"message": f"已临时调用 {driver['display_name']}，绑定车辆 {vehicle['code']} 并转为值班", "overview": overview(db)})
+
+    def _rebind_driver_vehicle(self, db: sqlite3.Connection, person_id: str, payload: dict, actor: sqlite3.Row) -> None:
+        driver = self._driver_target(db, person_id)
+        if driver["work_status"] != "ON_DUTY":
+            raise ValueError("只有值班人员可以更换车辆")
+        active = self._active_vehicle_tasks(db, driver["vehicle_id"], "PENDING", "IN_PROGRESS")
+        if active:
+            raise ValueError("该人员名下有待执行或作业中工单，请先完成或改派后再更换车辆")
+        new_vehicle = self._free_vehicle(db, payload.get("vehicleId"))
+        old_code = self._bound_vehicle_code(db, driver["vehicle_id"])
+        self._unbind_vehicle(db, driver)
+        try:
+            db.execute("UPDATE users SET vehicle_id=? WHERE id=?", (new_vehicle["id"], person_id))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"车辆 {new_vehicle['code']} 刚被其他值班人员占用，请重新选择") from exc
+        db.execute("UPDATE vehicles SET driver=?, updated_at=? WHERE id=?", (driver["display_name"], now(), new_vehicle["id"]))
+        log_operation(db, actor, "更换车辆", "加油人员", person_id, driver["display_name"],
+                      before=f"车辆={old_code}", after=f"车辆={new_vehicle['code']}")
+        self._send({"message": f"已将 {driver['display_name']} 的负责车辆由 {old_code} 更换为 {new_vehicle['code']}", "overview": overview(db)})
 
 
 def main() -> None:
