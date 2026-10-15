@@ -47,6 +47,7 @@ def connect() -> sqlite3.Connection:
 
 WORK_STATUSES = {"ON_DUTY": "值班", "STANDBY": "休闲", "RESTING": "休息"}
 PASSWORD_ITERATIONS = 120_000
+LOW_FUEL_RATIO = 0.2
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -276,6 +277,20 @@ def broadcast(
     )
 
 
+def check_low_fuel(db: sqlite3.Connection, vehicle_id: str) -> None:
+    """Surface a refuelling alert once per vehicle while it stays below the threshold."""
+    vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+    if not vehicle or vehicle["fuel_level"] * 5 >= vehicle["capacity"]:
+        return
+    level = "CRITICAL" if vehicle["fuel_level"] == 0 else "WARNING"
+    message = (
+        f"{vehicle['code']} 剩余油量 {vehicle['fuel_level']:,} L，低于安全阈值"
+        f"（容量的 {int(LOW_FUEL_RATIO * 100)}%），已暂停自动派工，请安排补油"
+    )
+    if alert(db, level, "VEHICLE_LOW_FUEL", message, vehicle["id"]):
+        broadcast(db, level, "加油车油量告警", message)
+
+
 def alert(db: sqlite3.Connection, level: str, kind: str, message: str, related_id: str | None = None) -> bool:
     existing = db.execute(
         "SELECT 1 FROM alerts WHERE type=? AND related_id IS ? AND resolved=0 LIMIT 1",
@@ -301,10 +316,12 @@ class Scheduler:
 
     @staticmethod
     def optimize(db: sqlite3.Connection) -> dict:
+        # PLANNED flights (e.g. just imported) are part of the dispatch queue;
+        # only a flight with an active task is excluded.
         waiting = rows(
             db,
             """SELECT f.* FROM flights f
-               WHERE f.status = 'WAITING' AND NOT EXISTS
+               WHERE f.status IN ('PLANNED','WAITING') AND NOT EXISTS
                (SELECT 1 FROM tasks t WHERE t.flight_id=f.id AND t.state IN ('PENDING','IN_PROGRESS'))
                ORDER BY f.priority DESC, f.departure_at ASC""",
         )
@@ -347,6 +364,10 @@ class Scheduler:
             )
             fleet = [item for item in fleet if item["id"] != vehicle["id"]]
             assignments.append({"taskId": task_id, "flight": flight["flight_no"], "vehicle": vehicle["code"], "etaMinutes": eta})
+        # Idle vehicles left below the safety threshold surface as alerts so the
+        # dispatcher can arrange refuelling instead of silently losing capacity.
+        for vehicle in fleet:
+            check_low_fuel(db, vehicle["id"])
         return {"assignments": assignments, "risks": risks}
 
 
@@ -368,7 +389,7 @@ def overview(db: sqlite3.Connection) -> dict:
     alerts = rows(db, "SELECT * FROM alerts WHERE resolved=0 ORDER BY created_at DESC LIMIT 10")
     broadcasts = rows(db, "SELECT * FROM broadcasts ORDER BY created_at DESC LIMIT 12")
     stats = {
-        "waiting": sum(f["status"] == "WAITING" for f in flights),
+        "waiting": sum(f["status"] in {"PLANNED", "WAITING"} for f in flights),
         "activeTasks": sum(t["state"] in {"PENDING", "IN_PROGRESS"} for t in active),
         "availableVehicles": sum(v["status"] == "AVAILABLE" for v in vehicles),
         "criticalAlerts": sum(a["level"] == "CRITICAL" for a in alerts),
@@ -500,6 +521,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._authorize(db, "DISPATCHER")
                     self._resolve_alert(db, path.split("/")[3], payload)
                     return
+                if path.startswith("/api/vehicles/") and path.endswith("/refuel"):
+                    dispatcher = self._authorize(db, "DISPATCHER")
+                    self._refuel_vehicle(db, path.split("/")[3], dispatcher)
+                    return
                 if path == "/api/admin/flights/import":
                     self._authorize(db, "DISPATCHER")
                     self._import_flights(db, payload)
@@ -507,6 +532,10 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/admin/broadcasts":
                     user = self._authorize(db, "DISPATCHER")
                     self._create_broadcast(db, payload, user)
+                    return
+                if path.startswith("/api/flights/") and path.count("/") == 3:
+                    dispatcher = self._authorize(db, "DISPATCHER")
+                    self._update_flight(db, path.split("/")[3], payload, dispatcher)
                     return
                 if path == "/api/auth/change-password":
                     user = self._authorize(db, "DISPATCHER", "DRIVER", "ADMIN")
@@ -612,11 +641,14 @@ class Handler(BaseHTTPRequestHandler):
         )
         tasks = rows(
             db,
-            """SELECT t.id, t.state, t.eta_minutes, t.updated_at, f.flight_no, f.gate,
-                      f.fuel_needed, f.priority, v.code vehicle_code, v.fuel_level, v.capacity
+            """SELECT t.id, t.state, t.eta_minutes, t.dispatch_order, t.updated_at,
+                      f.flight_no, f.gate, f.fuel_needed, f.priority,
+                      v.code vehicle_code, v.fuel_level, v.capacity
                FROM tasks t JOIN flights f ON f.id=t.flight_id JOIN vehicles v ON v.id=t.vehicle_id
                WHERE t.vehicle_id=? AND t.state NOT IN ('COMPLETED','CANCELLED')
-               ORDER BY f.priority DESC, f.departure_at ASC""",
+               ORDER BY CASE WHEN t.state='IN_PROGRESS' THEN 0 ELSE 1 END,
+                        CASE WHEN t.dispatch_order=0 THEN 999999 ELSE t.dispatch_order END,
+                        f.priority DESC, f.departure_at ASC""",
             (user["vehicle_id"],),
         ) if eligible else []
         return {
@@ -671,13 +703,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("异常上报必须填写原因")
         reported_fuel = None
         if state == "COMPLETED":
-            vehicle = db.execute("SELECT capacity FROM vehicles WHERE id=?", (task["vehicle_id"],)).fetchone()
+            vehicle = db.execute("SELECT fuel_level, capacity FROM vehicles WHERE id=?", (task["vehicle_id"],)).fetchone()
             try:
-                reported_fuel = int(payload.get("fuelLevel"))
+                fuel_loaded = int(payload.get("fuelLoaded"))
             except (TypeError, ValueError):
-                raise ValueError("完成作业时必须提交有效的当前油量")
-            if not 0 <= reported_fuel <= vehicle["capacity"]:
-                raise ValueError(f"当前油量应在 0 至 {vehicle['capacity']} 升之间")
+                raise ValueError("完成作业时必须提交本次加注量")
+            if not 0 <= fuel_loaded <= vehicle["fuel_level"]:
+                raise ValueError(f"本次加注量应在 0 至车辆当前油量 {vehicle['fuel_level']:,} 升之间")
+            reported_fuel = vehicle["fuel_level"] - fuel_loaded
         db.execute("UPDATE tasks SET state=?, updated_at=? WHERE id=?", (state, now(), task_id))
         if state in {"COMPLETED", "EXCEPTION"}:
             vehicle_status = "AVAILABLE" if state == "COMPLETED" else "MAINTENANCE"
@@ -688,6 +721,8 @@ class Handler(BaseHTTPRequestHandler):
                     "UPDATE vehicles SET status=?, fuel_level=?, updated_at=? WHERE id=?",
                     (vehicle_status, reported_fuel, now(), task["vehicle_id"]),
                 )
+            if state == "COMPLETED":
+                check_low_fuel(db, task["vehicle_id"])
             db.execute("UPDATE flights SET status=? WHERE id=(SELECT flight_id FROM tasks WHERE id=?)", ("COMPLETED" if state == "COMPLETED" else "WAITING", task_id))
             if state == "EXCEPTION":
                 message = f"工单异常：{reason}"
@@ -701,7 +736,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _override(self, db: sqlite3.Connection, task_id: str, payload: dict) -> None:
         vehicle_id = payload.get("vehicleId")
-        eta_minutes = payload.get("etaMinutes")
         dispatch_order = payload.get("dispatchOrder")
         task = db.execute("SELECT t.*, f.fuel_needed, f.flight_no FROM tasks t JOIN flights f ON f.id=t.flight_id WHERE t.id=?", (task_id,)).fetchone()
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
@@ -719,17 +753,15 @@ class Handler(BaseHTTPRequestHandler):
         if not driver:
             raise ValueError("该车辆没有值班加油人员负责，无法改派")
         try:
-            eta = int(eta_minutes)
             requested_order = int(dispatch_order)
         except (TypeError, ValueError) as exc:
-            raise ValueError("预计到达时间和执行顺序必须为数字") from exc
-        if not 1 <= eta <= 180:
-            raise ValueError("预计到达时间应在 1 至 180 分钟之间")
+            raise ValueError("执行顺序必须为数字") from exc
         if requested_order < 1:
             raise ValueError("执行顺序必须从 1 开始")
+        # 预计到达时间由系统按车辆与机位距离自动估算，调度员微调只改派车辆与顺序。
         db.execute(
-            "UPDATE tasks SET vehicle_id=?, eta_minutes=?, locked=1, updated_at=?, assigned_driver=? WHERE id=?",
-            (vehicle_id, eta, now(), driver["display_name"], task_id),
+            "UPDATE tasks SET vehicle_id=?, locked=1, updated_at=?, assigned_driver=? WHERE id=?",
+            (vehicle_id, now(), driver["display_name"], task_id),
         )
         self._resequence_tasks(db, task_id, requested_order)
         db.execute("UPDATE vehicles SET status='RESERVED', updated_at=? WHERE id=?", (now(), vehicle_id))
@@ -739,6 +771,14 @@ class Handler(BaseHTTPRequestHandler):
         alert_item = db.execute("SELECT * FROM alerts WHERE id=? AND resolved=0", (alert_id,)).fetchone()
         if not alert_item:
             raise ValueError("风险预警不存在或已处置")
+        if alert_item["type"] == "VEHICLE_LOW_FUEL":
+            vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (alert_item["related_id"],)).fetchone()
+            return {
+                "alert": dict(alert_item),
+                "vehicle": dict(vehicle) if vehicle else None,
+                "candidates": [],
+                "suggestion": "建议立即安排补油：补油后车辆恢复满容，自动重新参与调度；如涉及在保障航班，请评估是否需要临时调用其他车辆接续。",
+            }
         flight = None
         if alert_item["type"] == "NO_ELIGIBLE_VEHICLE":
             flight = db.execute("SELECT * FROM flights WHERE id=?", (alert_item["related_id"],)).fetchone()
@@ -785,6 +825,31 @@ class Handler(BaseHTTPRequestHandler):
         if not result.rowcount:
             raise ValueError("风险预警不存在或已处置")
         self._send({"message": "风险已完成处置并归档，可在交接班记录中追溯", "overview": overview(db)})
+
+    def _refuel_vehicle(self, db: sqlite3.Connection, vehicle_id: str, dispatcher: sqlite3.Row) -> None:
+        vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
+        if not vehicle:
+            raise ValueError("车辆不存在")
+        if vehicle["status"] == "MAINTENANCE":
+            raise ValueError("维修中的车辆需先恢复正常状态，再安排补油")
+        active = self._active_vehicle_tasks(db, vehicle_id, "PENDING", "IN_PROGRESS")
+        if active:
+            raise ValueError("该车辆名下有待执行或作业中工单，完成作业后才能补油")
+        db.execute(
+            "UPDATE vehicles SET fuel_level=capacity, status='AVAILABLE', updated_at=? WHERE id=?",
+            (now(), vehicle_id),
+        )
+        db.execute(
+            """UPDATE alerts SET resolved=1, resolution='调度员已安排补油，车辆恢复满容', resolved_at=?
+               WHERE type='VEHICLE_LOW_FUEL' AND related_id=? AND resolved=0""",
+            (now(), vehicle_id),
+        )
+        log_operation(db, dispatcher, "安排补油", "加油车", vehicle_id, vehicle["code"],
+                      before=f"油量={vehicle['fuel_level']:,}/{vehicle['capacity']:,} L",
+                      after=f"油量={vehicle['capacity']:,}/{vehicle['capacity']:,} L")
+        broadcast(db, "INFO", "加油车已完成补油", f"{vehicle['code']} 已恢复满容并重新参与自动调度。")
+        result = Scheduler.optimize(db)
+        self._send({"message": f"{vehicle['code']} 已完成补油并恢复可用", **result, "overview": overview(db)})
 
     @staticmethod
     def _resequence_tasks(db: sqlite3.Connection, task_id: str, requested_order: int) -> None:
@@ -836,6 +901,40 @@ class Handler(BaseHTTPRequestHandler):
             source="DISPATCH_IMPORT",
         )
         self._send({"message": f"已导入或更新 {imported} 条航班数据", "imported": imported, "rejected": rejected, "flights": rows(db, "SELECT * FROM flights ORDER BY departure_at")})
+
+    def _update_flight(self, db: sqlite3.Connection, flight_id: str, payload: dict, actor: sqlite3.Row) -> None:
+        flight = db.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise ValueError("航班不存在")
+        gate = str(payload.get("gate", flight["gate"])).strip().upper()
+        departure_at = str(payload.get("departureAt", flight["departure_at"])).strip()
+        try:
+            fuel_needed = int(payload.get("fuelNeeded", flight["fuel_needed"]))
+            priority = int(payload.get("priority", flight["priority"]))
+            x = int(payload.get("x", flight["x"]))
+            y = int(payload.get("y", flight["y"]))
+        except (TypeError, ValueError):
+            raise ValueError("需油量、优先级与机位坐标必须为数字")
+        if not gate or fuel_needed <= 0 or priority not in {1, 2, 3}:
+            raise ValueError("字段值不合法")
+        try:
+            datetime.fromisoformat(departure_at)
+        except ValueError:
+            raise ValueError("时间格式应为 ISO 8601，例如 2026-10-16T08:00:00+00:00")
+        active_task = db.execute(
+            "SELECT 1 FROM tasks WHERE flight_id=? AND state IN ('PENDING','IN_PROGRESS')", (flight_id,)
+        ).fetchone()
+        if active_task and (fuel_needed != flight["fuel_needed"]):
+            raise ValueError("该航班已有进行中的保障工单，需油量不可修改；请先完成或改派工单")
+        before = f"机位={flight['gate']} 离港={flight['departure_at']} 需油={flight['fuel_needed']:,}L 优先级={flight['priority']}"
+        db.execute(
+            "UPDATE flights SET gate=?, departure_at=?, fuel_needed=?, priority=?, x=?, y=? WHERE id=?",
+            (gate, departure_at, fuel_needed, priority, x, y, flight_id),
+        )
+        after = f"机位={gate} 离港={departure_at} 需油={fuel_needed:,}L 优先级={priority}"
+        log_operation(db, actor, "调整航班计划", "航班", flight_id, flight["flight_no"], before=before, after=after)
+        broadcast(db, "INFO", "航班计划已调整", f"{flight['flight_no']} 的计划已更新：机位 {gate}，离港 {departure_at}。", flight_id)
+        self._send({"message": f"{flight['flight_no']} 航班计划已更新", "overview": overview(db)})
 
     def _create_broadcast(self, db: sqlite3.Connection, payload: dict, user: sqlite3.Row) -> None:
         title = str(payload.get("title", "")).strip()

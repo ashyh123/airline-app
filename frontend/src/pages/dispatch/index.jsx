@@ -58,6 +58,15 @@ const workStyle = {
   RESTING: ['休息', 'default']
 };
 
+const flightStyle = {
+  PLANNED: ['已计划', 'default'],
+  WAITING: ['待保障', 'warning'],
+  ASSIGNED: ['已派单', 'info'],
+  COMPLETED: ['已完成', 'success'],
+  CANCELLED: ['已取消', 'default'],
+  DEPARTING: ['离港中', 'info']
+};
+
 const SECTIONS = [
   { id: 'overview', label: '态势总览', icon: <DashboardOutlined /> },
   { id: 'map', label: '机坪态势', icon: <EnvironmentOutlined /> },
@@ -189,11 +198,11 @@ export default function DispatchConsole() {
   const [assigning, setAssigning] = useState(false);
   const [overrideTask, setOverrideTask] = useState(null);
   const [selectedVehicle, setSelectedVehicle] = useState('');
-  const [plannedEta, setPlannedEta] = useState('');
   const [plannedOrder, setPlannedOrder] = useState('');
   const [handlingAlert, setHandlingAlert] = useState(null);
   const [resolutionNote, setResolutionNote] = useState('');
   const [resolvingAlert, setResolvingAlert] = useState(false);
+  const [refuelling, setRefuelling] = useState(false);
   const [activeSection, setActiveSection] = useState('overview');
   const [importing, setImporting] = useState(false);
   const [broadcasting, setBroadcasting] = useState(false);
@@ -207,6 +216,8 @@ export default function DispatchConsole() {
   const [statusTarget, setStatusTarget] = useState(null);
   const [statusReason, setStatusReason] = useState('');
   const [personActing, setPersonActing] = useState(false);
+  const [flightEdit, setFlightEdit] = useState(null);
+  const [flightSaving, setFlightSaving] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   const load = useCallback(async () => {
@@ -268,7 +279,6 @@ export default function DispatchConsole() {
     try {
       await command(`/tasks/${overrideTask.id}/override`, {
         vehicleId: selectedVehicle,
-        etaMinutes: plannedEta,
         dispatchOrder: plannedOrder
       });
       setOverrideTask(null);
@@ -295,6 +305,32 @@ export default function DispatchConsole() {
       await command(`/alerts/${handlingAlert.alert.id}/resolve`, { resolution: resolutionNote });
       setHandlingAlert(null);
     } catch (err) { setError(err.message); } finally { setResolvingAlert(false); }
+  }
+
+  async function refuelFromAlert() {
+    setRefuelling(true);
+    try {
+      await command(`/vehicles/${handlingAlert.alert.related_id}/refuel`);
+      setHandlingAlert(null);
+    } catch (err) { setError(err.message); } finally { setRefuelling(false); }
+  }
+
+  async function refuelVehicle(vehicleId) {
+    setRefuelling(true);
+    try { await command(`/vehicles/${vehicleId}/refuel`); } catch (err) { setError(err.message); } finally { setRefuelling(false); }
+  }
+
+  async function saveFlightEdit() {
+    setFlightSaving(true);
+    try {
+      await command(`/flights/${flightEdit.id}`, {
+        gate: flightEdit.gate,
+        departureAt: flightEdit.departure_at,
+        fuelNeeded: Number(flightEdit.fuel_needed),
+        priority: Number(flightEdit.priority)
+      });
+      setFlightEdit(null);
+    } catch (err) { setError(err.message); } finally { setFlightSaving(false); }
   }
 
   function jumpTo(id) {
@@ -360,10 +396,33 @@ export default function DispatchConsole() {
 
         {data && <>
           <Grid id="section-overview" container spacing={2} sx={{ scrollMarginTop: '88px' }}>
-            <Grid size={{ xs: 6, md: 3 }}><Metric label="待保障航班" value={data.stats.waiting} note="按优先级进入调度队列" tone="warning" /></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Metric label="待保障航班" value={data.stats.waiting} note="含已计划与待保障，按优先级入队" tone="warning" /></Grid>
             <Grid size={{ xs: 6, md: 3 }}><Metric label="进行中工单" value={data.stats.activeTasks} note="含已下发与正在作业" tone="info" /></Grid>
             <Grid size={{ xs: 6, md: 3 }}><Metric label="车辆利用率" value={`${data.stats.vehicleUtilization}%`} note="当前班组实时占用" tone="success" /></Grid>
             <Grid size={{ xs: 6, md: 3 }}><Metric label="严重风险" value={data.stats.criticalAlerts} note="须由调度员尽快处理" tone="error" /></Grid>
+            <Grid size={{ xs: 12 }}>
+              <Paper variant="outlined" sx={{ p: 2.25 }}>
+                <Stack direction="row" sx={{ justifyContent: 'space-between', alignItems: 'center', mb: 1.25 }}>
+                  <Box><Typography variant="h6">航班计划</Typography><Typography variant="caption" color="text.secondary">含导入与事件接入的航班，点击“生成调度方案”后按优先级进入调度队列</Typography></Box>
+                  <Chip size="small" variant="outlined" label={`共 ${data.flights.length} 班`} />
+                </Stack>
+                <Table size="small" sx={{ minWidth: 640 }}>
+                  <TableHead><TableRow><TableCell>航班</TableCell><TableCell>机位</TableCell><TableCell>离港时间</TableCell><TableCell>需油量</TableCell><TableCell>优先级</TableCell><TableCell>状态</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
+                  <TableBody>{data.flights.map((flight) => {
+                    const [flightLabel, flightColor] = flightStyle[flight.status] ?? [flight.status, 'default'];
+                    return <TableRow key={flight.id} hover>
+                      <TableCell><Typography fontWeight={600}>{flight.flight_no}</Typography></TableCell>
+                      <TableCell>{flight.gate}</TableCell>
+                      <TableCell>{new Date(flight.departure_at).toLocaleString('zh-CN', { hour12: false })}</TableCell>
+                      <TableCell>{flight.fuel_needed.toLocaleString()} L</TableCell>
+                      <TableCell><Chip size="small" color={flight.priority === 3 ? 'error' : flight.priority === 2 ? 'warning' : 'default'} label={flight.priority === 3 ? '高' : flight.priority === 2 ? '中' : '低'} /></TableCell>
+                      <TableCell><Chip size="small" label={flightLabel} color={flightColor} variant={flightColor === 'default' ? 'outlined' : 'filled'} /></TableCell>
+                      <TableCell align="right"><Button size="small" variant="outlined" onClick={() => setFlightEdit({ ...flight })}>调整</Button></TableCell>
+                    </TableRow>;
+                  })}</TableBody>
+                </Table>
+              </Paper>
+            </Grid>
           </Grid>
 
           <Grid container spacing={2}>
@@ -391,15 +450,15 @@ export default function DispatchConsole() {
           <Box id="section-timeline" sx={{ scrollMarginTop: '88px' }}><DispatchTimeline vehicles={data.vehicles} tasks={data.tasks} /></Box>
 
           <Paper id="section-tasks" variant="outlined" sx={{ overflow: 'hidden', scrollMarginTop: '88px' }}>
-            <Box sx={{ p: 2.25, pb: 1 }}><Typography variant="h6">作业工单</Typography><Typography variant="body2" color="text.secondary">先由智能调度生成方案；调度员可对待执行工单微调车辆、预计到达时间和执行顺序。人工调整会锁定该工单，执行状态仍由对应油车工作人员上报。</Typography></Box>
+            <Box sx={{ p: 2.25, pb: 1 }}><Typography variant="h6">作业工单</Typography><Typography variant="body2" color="text.secondary">先由智能调度生成方案；调度员可对待执行工单改派车辆和调整执行顺序。人工调整会锁定该工单，执行状态仍由对应油车工作人员上报。</Typography></Box>
             <Table size="small" sx={{ minWidth: 760 }}>
               <TableHead><TableRow><TableCell>顺序</TableCell><TableCell>航班 / 机位</TableCell><TableCell>优先级</TableCell><TableCell>已派车辆</TableCell><TableCell>预计到达</TableCell><TableCell>状态</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
-              <TableBody>{data.tasks.map((task) => <TableRow key={task.id} hover><TableCell>{task.state === 'PENDING' ? <Chip size="small" label={`#${task.dispatch_order || '—'}`} variant="outlined" /> : '—'}</TableCell><TableCell><Typography fontWeight={600}>{task.flight_no}</Typography><Typography variant="caption" color="text.secondary">{task.gate} · 需油 {task.fuel_needed.toLocaleString()} L</Typography></TableCell><TableCell><Chip size="small" color={task.priority === 3 ? 'error' : task.priority === 2 ? 'warning' : 'default'} label={task.priority === 3 ? '高' : task.priority === 2 ? '中' : '低'} /></TableCell><TableCell>{task.vehicle_code ?? '未分配'}<Typography variant="caption" display="block" color="text.secondary">{task.driver ?? ''}</Typography></TableCell><TableCell>{task.eta_minutes ? `${task.eta_minutes} 分钟` : '—'}</TableCell><TableCell><Stack direction="row" spacing={0.5}><StateChip value={task.state} />{Boolean(task.locked) && <Chip size="small" label="人工锁定" variant="outlined" />}</Stack></TableCell><TableCell align="right">{task.state === 'PENDING' ? <Button size="small" variant="outlined" onClick={() => { setOverrideTask(task); setSelectedVehicle(task.vehicle_id ?? ''); setPlannedEta(task.eta_minutes ?? ''); setPlannedOrder(task.dispatch_order || 1); }}>微调方案</Button> : <Typography variant="caption" color="text.secondary">由司机上报</Typography>}</TableCell></TableRow>)}</TableBody>
+              <TableBody>{data.tasks.map((task) => <TableRow key={task.id} hover><TableCell>{task.state === 'PENDING' ? <Chip size="small" label={`#${task.dispatch_order || '—'}`} variant="outlined" /> : '—'}</TableCell><TableCell><Typography fontWeight={600}>{task.flight_no}</Typography><Typography variant="caption" color="text.secondary">{task.gate} · 需油 {task.fuel_needed.toLocaleString()} L</Typography></TableCell><TableCell><Chip size="small" color={task.priority === 3 ? 'error' : task.priority === 2 ? 'warning' : 'default'} label={task.priority === 3 ? '高' : task.priority === 2 ? '中' : '低'} /></TableCell><TableCell>{task.vehicle_code ?? '未分配'}<Typography variant="caption" display="block" color="text.secondary">{task.driver ?? ''}</Typography></TableCell><TableCell>{task.eta_minutes ? `${task.eta_minutes} 分钟` : '—'}</TableCell><TableCell><Stack direction="row" spacing={0.5}><StateChip value={task.state} />{Boolean(task.locked) && <Chip size="small" label="人工锁定" variant="outlined" />}</Stack></TableCell><TableCell align="right">{task.state === 'PENDING' ? <Button size="small" variant="outlined" onClick={() => { setOverrideTask(task); setSelectedVehicle(task.vehicle_id ?? ''); setPlannedOrder(String(task.dispatch_order || 1)); }}>微调方案</Button> : <Typography variant="caption" color="text.secondary">由司机上报</Typography>}</TableCell></TableRow>)}</TableBody>
             </Table>
           </Paper>
 
           <Grid container spacing={2}>
-            <Grid id="section-resources" size={{ xs: 12, lg: 7 }} sx={{ scrollMarginTop: '88px' }}><Paper variant="outlined" sx={{ p: 2.25 }}><Typography variant="h6" mb={1.5}>加油车资源</Typography><Stack spacing={1.5}>{data.vehicles.map((vehicle) => <Box key={vehicle.id}><Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}><Typography variant="body2" fontWeight={600}>{vehicle.code} <Typography component="span" variant="caption" color="text.secondary">· {vehicle.driver}</Typography></Typography><Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}><Typography variant="caption">{vehicle.fuel_level.toLocaleString()} / {vehicle.capacity.toLocaleString()} L</Typography><StateChip value={vehicle.status} /></Stack></Stack><LinearProgress variant="determinate" value={Math.round(vehicle.fuel_level / vehicle.capacity * 100)} color={vehicle.fuel_level / vehicle.capacity < .35 ? 'warning' : 'primary'} /></Box>)}</Stack></Paper></Grid>
+            <Grid id="section-resources" size={{ xs: 12, lg: 7 }} sx={{ scrollMarginTop: '88px' }}><Paper variant="outlined" sx={{ p: 2.25 }}><Typography variant="h6" mb={1.5}>加油车资源</Typography><Stack spacing={1.5}>{data.vehicles.map((vehicle) => <Box key={vehicle.id}><Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mb: 0.5 }}><Typography variant="body2" fontWeight={600}>{vehicle.code} <Typography component="span" variant="caption" color="text.secondary">· {vehicle.driver}</Typography></Typography><Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}><Typography variant="caption">{vehicle.fuel_level.toLocaleString()} / {vehicle.capacity.toLocaleString()} L</Typography><StateChip value={vehicle.status} />{vehicle.fuel_level * 5 < vehicle.capacity && vehicle.status !== 'MAINTENANCE' && <Button size="small" variant="outlined" color="warning" disabled={refuelling} onClick={() => refuelVehicle(vehicle.id)}>补油</Button>}</Stack></Stack><LinearProgress variant="determinate" value={Math.round(vehicle.fuel_level / vehicle.capacity * 100)} color={vehicle.fuel_level / vehicle.capacity < .35 ? 'warning' : 'primary'} /></Box>)}</Stack></Paper></Grid>
             <Grid size={{ xs: 12, lg: 5 }}><Paper variant="outlined" sx={{ p: 2.25, height: '100%' }}><Typography variant="h6">运行指标</Typography><Stack spacing={2} mt={2}><Box><Stack direction="row" sx={{ justifyContent: 'space-between' }}><Typography variant="body2">按时保障率</Typography><Typography variant="body2" fontWeight={700}>{data.stats.onTimeRate}%</Typography></Stack><LinearProgress variant="determinate" value={data.stats.onTimeRate} color="success" sx={{ mt: 0.75 }} /></Box></Stack></Paper></Grid>
           </Grid>
 
@@ -449,7 +508,7 @@ export default function DispatchConsole() {
 
           <Paper id="section-import" variant="outlined" sx={{ p: 2.25, scrollMarginTop: '88px' }}>
             <Typography variant="h6">导入航班数据</Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>支持 UTF-8 的 CSV 或 JSON 数组。CSV 表头：flightNo、gate、departureAt、fuelNeeded、priority、x、y。</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>支持 UTF-8 的 CSV 或 JSON 数组。CSV 表头：flightNo、gate、departureAt、fuelNeeded、priority、x、y。导入的航班即进入待保障队列，点击上方“生成调度方案”即自动派单。</Typography>
             <Stack direction="row" spacing={1.5} sx={{ mt: 2, alignItems: 'center', flexWrap: 'wrap' }}>
               <Button component="label" variant="contained" disabled={importing}>{importing ? '导入中…' : '选择 CSV 或 JSON 文件'}<input hidden type="file" accept=".csv,.json,application/json,text/csv" onChange={importFile} /></Button>
               <Typography variant="caption" color="text.secondary">示例：{example}</Typography>
@@ -481,8 +540,8 @@ export default function DispatchConsole() {
 
       <Dialog open={Boolean(overrideTask)} onClose={() => setOverrideTask(null)} fullWidth maxWidth="xs">
         <DialogTitle>人工微调调度方案</DialogTitle>
-        <DialogContent><Typography variant="body2" color="text.secondary" mb={2.5}>保存后将锁定本工单，后续自动调度不会覆盖你的车辆、时间和顺序安排。系统会校验车辆状态与可用油量。</Typography><Stack spacing={2.25}><Stack spacing={0.75}><Typography variant="body2" fontWeight={700}>指定加油车</Typography><Select aria-label="指定加油车" fullWidth value={selectedVehicle} onChange={(event) => setSelectedVehicle(event.target.value)}>{data?.vehicles.map((vehicle) => <MenuItem key={vehicle.id} value={vehicle.id}>{vehicle.code} · {vehicle.driver} · {vehicle.fuel_level.toLocaleString()} L · {stateStyle[vehicle.status]?.[0]}</MenuItem>)}</Select></Stack><Stack spacing={0.75}><Typography variant="body2" fontWeight={700}>预计到达（分钟）</Typography><TextField aria-label="预计到达（分钟）" fullWidth type="number" value={plannedEta} onChange={(event) => setPlannedEta(event.target.value)} inputProps={{ min: 1, max: 180 }} /></Stack><Stack spacing={0.75}><Typography variant="body2" fontWeight={700}>执行顺序</Typography><TextField aria-label="执行顺序" fullWidth type="number" value={plannedOrder} onChange={(event) => setPlannedOrder(event.target.value)} inputProps={{ min: 1, max: data?.tasks.filter((task) => task.state === 'PENDING').length ?? 1 }} /><Typography variant="caption" color="text.secondary">1 为当前待执行队列中的最优先工单</Typography></Stack></Stack></DialogContent>
-        <DialogActions><Button onClick={() => setOverrideTask(null)}>取消</Button><Button variant="contained" onClick={override} disabled={!selectedVehicle || !plannedEta || !plannedOrder}>保存微调</Button></DialogActions>
+        <DialogContent><Typography variant="body2" color="text.secondary" mb={2.5}>保存后将锁定本工单，后续自动调度不会覆盖你的车辆和顺序安排。预计到达时间由系统按车辆与机位距离自动估算，不支持手工调整。系统会校验车辆状态与可用油量。</Typography><Stack spacing={2.25}><Stack spacing={0.75}><Typography variant="body2" fontWeight={700}>指定加油车</Typography><Select aria-label="指定加油车" fullWidth value={selectedVehicle} onChange={(event) => setSelectedVehicle(event.target.value)}>{data?.vehicles.map((vehicle) => <MenuItem key={vehicle.id} value={vehicle.id}>{vehicle.code} · {vehicle.driver} · {vehicle.fuel_level.toLocaleString()} L · {stateStyle[vehicle.status]?.[0]}</MenuItem>)}</Select></Stack><Stack spacing={0.75}><Typography variant="body2" fontWeight={700}>执行顺序</Typography><TextField aria-label="执行顺序" fullWidth type="text" value={plannedOrder} onChange={(event) => setPlannedOrder(event.target.value.replace(/[^0-9]/g, ''))} inputProps={{ inputMode: 'numeric', pattern: '[0-9]*' }} helperText="1 为当前待执行队列中的最优先工单" /></Stack></Stack></DialogContent>
+        <DialogActions><Button onClick={() => setOverrideTask(null)}>取消</Button><Button variant="contained" onClick={override} disabled={!selectedVehicle || !/^[1-9][0-9]*$/.test(plannedOrder)}>保存微调</Button></DialogActions>
       </Dialog>
 
       <Dialog open={Boolean(handlingAlert)} onClose={() => !resolvingAlert && setHandlingAlert(null)} fullWidth maxWidth="sm">
@@ -490,12 +549,43 @@ export default function DispatchConsole() {
         <DialogContent>
           <Typography variant="body2" color="text.secondary" mb={2}>{handlingAlert?.alert.message}</Typography>
           {handlingAlert?.loading ? <LinearProgress /> : <Stack spacing={1.25}>
-            <Typography variant="subtitle2">可协调资源</Typography>
-            {handlingAlert?.details?.candidates?.length ? handlingAlert.details.candidates.map((vehicle) => <Paper key={vehicle.id} variant="outlined" sx={{ p: 1.25 }}><Stack direction="row" sx={{ justifyContent: 'space-between', gap: 1 }}><Typography variant="body2" fontWeight={700}>{vehicle.code} · {vehicle.driver}</Typography><StateChip value={vehicle.status} /></Stack><Typography variant="caption" display="block" color="text.secondary" mt={0.5}>可用油量 {vehicle.fuel_level.toLocaleString()} L · {vehicle.recommendation}</Typography></Paper>) : <Alert severity="warning">当前没有满足油量约束的可协调车辆。请安排补油、外援或调整保障计划后再处置。</Alert>}
+            {handlingAlert?.details?.suggestion && <Alert severity="info">{handlingAlert.details.suggestion}</Alert>}
+            {handlingAlert?.alert?.type === 'VEHICLE_LOW_FUEL' ? (
+              <Alert severity="warning" action={<Button color="inherit" size="small" disabled={refuelling} onClick={refuelFromAlert}>{refuelling ? '补油中…' : '补油并恢复派工'}</Button>}>
+                {handlingAlert?.details?.vehicle ? `${handlingAlert.details.vehicle.code} 当前油量 ${handlingAlert.details.vehicle.fuel_level.toLocaleString()} / ${handlingAlert.details.vehicle.capacity.toLocaleString()} L。` : ''}补油后该告警自动闭环，车辆立即重新参与自动调度。
+              </Alert>
+            ) : <>
+              <Typography variant="subtitle2">可协调资源</Typography>
+              {handlingAlert?.details?.candidates?.length ? handlingAlert.details.candidates.map((vehicle) => <Paper key={vehicle.id} variant="outlined" sx={{ p: 1.25 }}><Stack direction="row" sx={{ justifyContent: 'space-between', gap: 1 }}><Typography variant="body2" fontWeight={700}>{vehicle.code} · {vehicle.driver}</Typography><StateChip value={vehicle.status} /></Stack><Typography variant="caption" display="block" color="text.secondary" mt={0.5}>可用油量 {vehicle.fuel_level.toLocaleString()} L · {vehicle.recommendation}</Typography></Paper>) : <Alert severity="warning">当前没有满足油量约束的可协调车辆。请安排补油、外援或调整保障计划后再处置。</Alert>}
+            </>}
             <TextField label="处置说明" placeholder="例如：已协调 JF-03 完成当前任务后接续保障" multiline minRows={3} value={resolutionNote} onChange={(event) => setResolutionNote(event.target.value)} helperText="处置完成后将归档，供交接班追溯。" />
           </Stack>}
         </DialogContent>
         <DialogActions><Button onClick={() => setHandlingAlert(null)} disabled={resolvingAlert}>取消</Button><Button variant="contained" onClick={resolveAlert} disabled={handlingAlert?.loading || resolutionNote.trim().length < 4 || resolvingAlert}>{resolvingAlert ? '归档中…' : '确认处置并归档'}</Button></DialogActions>
+      </Dialog>
+
+      <Dialog open={Boolean(flightEdit)} onClose={() => !flightSaving && setFlightEdit(null)} fullWidth maxWidth="xs">
+        <DialogTitle>调整航班计划 · {flightEdit?.flight_no}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1 }}>
+            <Typography variant="body2" color="text.secondary">修改后实时同步到态势总览、机坪态势与调度队列；已有进行中的保障工单时不可修改需油量。</Typography>
+            <TextField label="预计离港时间" value={flightEdit?.departure_at ?? ''} onChange={(event) => setFlightEdit((f) => ({ ...f, departure_at: event.target.value }))} helperText="ISO 8601 格式，例如 2026-10-16T08:00:00+00:00" />
+            <TextField label="机位" value={flightEdit?.gate ?? ''} onChange={(event) => setFlightEdit((f) => ({ ...f, gate: event.target.value }))} inputProps={{ maxLength: 8 }} />
+            <TextField label="需油量（L）" type="text" value={flightEdit?.fuel_needed ?? ''} onChange={(event) => setFlightEdit((f) => ({ ...f, fuel_needed: event.target.value.replace(/[^0-9]/g, '') }))} inputProps={{ inputMode: 'numeric', pattern: '[0-9]*' }} />
+            <Stack spacing={0.75}>
+              <Typography variant="body2" fontWeight={700}>优先级</Typography>
+              <Select fullWidth value={String(flightEdit?.priority ?? 1)} onChange={(event) => setFlightEdit((f) => ({ ...f, priority: Number(event.target.value) }))}>
+                <MenuItem value="3">高</MenuItem>
+                <MenuItem value="2">中</MenuItem>
+                <MenuItem value="1">低</MenuItem>
+              </Select>
+            </Stack>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setFlightEdit(null)} disabled={flightSaving}>取消</Button>
+          <Button variant="contained" disabled={flightSaving || !flightEdit?.gate || !flightEdit?.departure_at || !(Number(flightEdit?.fuel_needed) > 0)} onClick={saveFlightEdit}>{flightSaving ? '保存中…' : '保存调整'}</Button>
+        </DialogActions>
       </Dialog>
 
       <Dialog open={Boolean(callTarget)} onClose={() => !personActing && setCallTarget(null)} fullWidth maxWidth="xs">
