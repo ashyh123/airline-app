@@ -19,7 +19,7 @@ import TableHead from '@mui/material/TableHead';
 import TableRow from '@mui/material/TableRow';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
-import { apiHeaders } from 'utils/auth';
+import { apiFetch, apiHeaders } from 'utils/auth';
 
 const API = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8080/api';
 const WORK_LABEL = { ON_DUTY: '值班', STANDBY: '休闲', RESTING: '休息' };
@@ -41,6 +41,7 @@ export default function AdminWorkspace() {
   const [status, setStatus] = useState('');
   const [keyword, setKeyword] = useState('');
   const [error, setError] = useState('');
+  const [formError, setFormError] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
@@ -57,7 +58,7 @@ export default function AdminWorkspace() {
       if (role) params.set('role', role);
       if (status) params.set('status', status);
       if (keyword.trim()) params.set('q', keyword.trim());
-      const response = await fetch(`${API}/admin/personnel?${params.toString()}`, { headers: apiHeaders() });
+      const response = await apiFetch(`${API}/admin/personnel?${params.toString()}`, { headers: apiHeaders() });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
       setPersonnel(data.personnel);
@@ -72,7 +73,7 @@ export default function AdminWorkspace() {
   useEffect(() => { load(); }, [load]);
 
   async function post(path, body) {
-    const response = await fetch(`${API}${path}`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(body ?? {}) });
+    const response = await apiFetch(`${API}${path}`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(body ?? {}) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error ?? '操作未完成');
     return data;
@@ -81,6 +82,7 @@ export default function AdminWorkspace() {
   async function createPerson(event) {
     event.preventDefault();
     setSubmitting(true);
+    setFormError('');
     try {
       const data = await post('/admin/personnel', form);
       setMessage(data.message);
@@ -89,7 +91,7 @@ export default function AdminWorkspace() {
       setError('');
       await load();
     } catch (err) {
-      setError(err.message);
+      setFormError(err.message);
     } finally {
       setSubmitting(false);
     }
@@ -97,8 +99,9 @@ export default function AdminWorkspace() {
 
   async function saveEdit() {
     setSubmitting(true);
+    setFormError('');
     try {
-      const response = await fetch(`${API}/admin/personnel/${editTarget.id}/profile`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(editForm) });
+      const response = await apiFetch(`${API}/admin/personnel/${editTarget.id}/profile`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify(editForm) });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
       setMessage(data.message);
@@ -106,7 +109,7 @@ export default function AdminWorkspace() {
       setError('');
       await load();
     } catch (err) {
-      setError(err.message);
+      setFormError(err.message);
     } finally {
       setSubmitting(false);
     }
@@ -125,6 +128,7 @@ export default function AdminWorkspace() {
 
   async function confirmToggle() {
     setSubmitting(true);
+    setFormError('');
     try {
       const action = toggleTarget.account_status === 'ENABLED' ? 'disable' : 'enable';
       const data = await post(`/admin/personnel/${toggleTarget.id}/${action}`);
@@ -133,8 +137,7 @@ export default function AdminWorkspace() {
       setError('');
       await load();
     } catch (err) {
-      setError(err.message);
-      setToggleTarget(null);
+      setFormError(err.message);
     } finally {
       setSubmitting(false);
     }
@@ -165,11 +168,11 @@ export default function AdminWorkspace() {
           </Select>
           <TextField aria-label="搜索" size="small" value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="按工号、姓名、账号搜索" sx={{ minWidth: 220 }} />
           <Box sx={{ flexGrow: 1 }} />
-          <Button variant="contained" onClick={() => setCreateOpen(true)}>创建人员账号</Button>
+          <Button variant="contained" onClick={() => { setFormError(''); setCreateOpen(true); }}>创建人员账号</Button>
         </Stack>
       </Paper>
 
-      <Paper variant="outlined" sx={{ overflow: 'hidden' }}>
+      <Paper variant="outlined" sx={{ overflowX: 'auto' }}>
         {loading ? (
           <Box sx={{ display: 'grid', placeItems: 'center', minHeight: 200 }}><CircularProgress /></Box>
         ) : (
@@ -195,9 +198,9 @@ export default function AdminWorkspace() {
                   <TableCell>{person.created_at ? new Date(person.created_at).toLocaleString('zh-CN', { hour12: false }) : '—'}</TableCell>
                   <TableCell align="right">
                     <Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end' }}>
-                      <Button size="small" variant="outlined" onClick={() => { setEditTarget(person); setEditForm({ name: person.display_name, phone: person.phone ?? '' }); }}>编辑</Button>
+                      <Button size="small" variant="outlined" onClick={() => { setFormError(''); setEditTarget(person); setEditForm({ name: person.display_name, phone: person.phone ?? '' }); }}>编辑</Button>
                       <Button size="small" variant="outlined" onClick={() => resetPassword(person)}>重置密码</Button>
-                      <Button size="small" variant="outlined" color={person.account_status === 'ENABLED' ? 'error' : 'success'} onClick={() => setToggleTarget(person)}>{person.account_status === 'ENABLED' ? '停用' : '启用'}</Button>
+                      <Button size="small" variant="outlined" color={person.account_status === 'ENABLED' ? 'error' : 'success'} onClick={() => { setFormError(''); setToggleTarget(person); }}>{person.account_status === 'ENABLED' ? '停用' : '启用'}</Button>
                     </Stack>
                   </TableCell>
                 </TableRow>
@@ -212,6 +215,7 @@ export default function AdminWorkspace() {
         <DialogTitle>创建人员账号</DialogTitle>
         <DialogContent>
           <Stack component="form" id="create-person-form" onSubmit={createPerson} spacing={2} sx={{ mt: 1 }}>
+            {formError && <Alert severity="error">{formError}</Alert>}
             <Stack spacing={0.75}>
               <Typography variant="body2" fontWeight={700}>角色</Typography>
               <Select aria-label="角色" fullWidth value={form.role} onChange={setField('role')}>
@@ -244,6 +248,7 @@ export default function AdminWorkspace() {
         <DialogTitle>编辑人员资料</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1 }}>
+            {formError && <Alert severity="error">{formError}</Alert>}
             <Typography variant="body2" color="text.secondary">账号 {editTarget?.username}（{editTarget?.emp_no}）· 账号与工号创建后不可修改</Typography>
             <TextField required label="姓名" value={editForm.name} onChange={(event) => setEditForm((previous) => ({ ...previous, name: event.target.value }))} />
             <TextField label="联系电话" value={editForm.phone} onChange={(event) => setEditForm((previous) => ({ ...previous, phone: event.target.value }))} />
@@ -272,6 +277,7 @@ export default function AdminWorkspace() {
       <Dialog open={Boolean(toggleTarget)} onClose={() => !submitting && setToggleTarget(null)} fullWidth maxWidth="xs">
         <DialogTitle>{toggleTarget?.account_status === 'ENABLED' ? '停用账号' : '启用账号'}</DialogTitle>
         <DialogContent>
+          {formError && <Alert severity="error" sx={{ mt: 1 }}>{formError}</Alert>}
           <Typography variant="body2" sx={{ mt: 1 }}>
             {toggleTarget?.account_status === 'ENABLED'
               ? `停用后 ${toggleTarget?.display_name}（${toggleTarget?.username}）将立即无法登录，已有会话失效；名下有待执行或作业中工单时将被阻止。`

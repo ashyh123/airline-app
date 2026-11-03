@@ -16,7 +16,10 @@ const API = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8080/api';
 export default function LoginPage() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(() => {
+    const reason = new URLSearchParams(window.location.search).get('session');
+    return reason === 'expired' ? '登录已失效，请重新登录。' : reason === 'password-change' ? '请重新登录并修改初始密码。' : '';
+  });
   const [loading, setLoading] = useState(false);
   const [pendingUser, setPendingUser] = useState(null);
   const [oldPassword, setOldPassword] = useState('');
@@ -26,6 +29,7 @@ export default function LoginPage() {
 
   async function login(event) {
     event.preventDefault();
+    setError('');
     setLoading(true);
     try {
       const response = await fetch(`${API}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
@@ -61,8 +65,13 @@ export default function LoginPage() {
         body: JSON.stringify({ oldPassword, newPassword })
       });
       const data = await response.json();
+      if (response.status === 401) {
+        setPendingUser(null);
+        setPassword('');
+        throw new Error('登录已失效，请使用管理员最新交付的密码重新登录。');
+      }
       if (!response.ok) throw new Error(data.error ?? '密码修改失败');
-      saveUser({ ...data.user, token: pendingUser.token });
+      saveUser(data.user);
       navigate('/', { replace: true });
     } catch (err) {
       setError(err.message);

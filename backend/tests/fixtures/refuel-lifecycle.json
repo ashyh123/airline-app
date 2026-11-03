@@ -1,0 +1,5 @@
+{
+  "before": {"status": "AVAILABLE", "fuel": 3900},
+  "sent": {"status": "REFUELLING", "fuel": 3900},
+  "completed": {"status": "AVAILABLE", "fuel": 12000, "atRefuelPoint": true}
+}

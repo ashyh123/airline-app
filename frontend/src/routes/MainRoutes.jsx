@@ -1,6 +1,5 @@
 import { Navigate } from 'react-router-dom';
 import DashboardLayout from 'layout/Dashboard';
-import DispatchConsole from 'pages/dispatch';
 import RouteError from 'pages/RouteError';
 import RoleHome from 'pages/RoleHome';
 

@@ -19,7 +19,7 @@ import Typography from '@mui/material/Typography';
 import MainCard from 'components/MainCard';
 import IconButton from 'components/@extended/IconButton';
 import Transitions from 'components/@extended/Transitions';
-import { apiHeaders, currentUser } from 'utils/auth';
+import { apiFetch, apiHeaders, currentUser } from 'utils/auth';
 
 import BellOutlined from '@ant-design/icons/BellOutlined';
 import CheckCircleOutlined from '@ant-design/icons/CheckCircleOutlined';
@@ -37,7 +37,7 @@ function formatTime(value) {
 }
 
 function dispatcherNotices(data) {
-  const broadcasts = (data.broadcasts ?? []).map((item) => ({
+  const broadcasts = (data.broadcasts ?? []).filter((item) => item.source === 'SYSTEM').map((item) => ({
     id: `broadcast-${item.id}`,
     title: item.title,
     detail: item.content,
@@ -53,12 +53,12 @@ function dispatcherNotices(data) {
     tone: alert.level === 'CRITICAL' ? 'error' : 'warning',
     icon: <WarningOutlined />
   }));
-  const tasks = (data.tasks ?? []).filter((task) => task.state === 'PENDING' || task.state === 'IN_PROGRESS').map((task) => ({
+  const tasks = (data.tasks ?? []).filter((task) => ['PENDING', 'IN_PROGRESS', 'AWAITING_REVIEW'].includes(task.state)).map((task) => ({
     id: `task-${task.id}-${task.state}-${task.updated_at}`,
-    title: task.locked ? '人工微调方案已锁定' : task.state === 'IN_PROGRESS' ? '加油作业正在进行' : '调度方案待执行',
+    title: task.state === 'AWAITING_REVIEW' ? '加注差额待确认后续保障' : task.locked ? '人工微调方案已锁定' : task.state === 'IN_PROGRESS' ? '加油作业正在进行' : '调度方案待执行',
     detail: `${task.flight_no} · ${task.gate}${task.vehicle_code ? ` · ${task.vehicle_code}` : ''}${task.eta_minutes ? ` · 预计 ${task.eta_minutes} 分钟到达` : ''}`,
     createdAt: task.updated_at,
-    tone: task.locked ? 'primary' : task.state === 'IN_PROGRESS' ? 'info' : 'success',
+    tone: task.state === 'AWAITING_REVIEW' ? 'warning' : task.locked ? 'primary' : task.state === 'IN_PROGRESS' ? 'info' : 'success',
     icon: task.locked ? <SafetyCertificateOutlined /> : <ClockCircleOutlined />
   }));
   return [...broadcasts, ...risks, ...tasks].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 12);
@@ -67,10 +67,10 @@ function dispatcherNotices(data) {
 function driverNotices(data) {
   return (data.tasks ?? []).map((task) => ({
     id: `driver-task-${task.id}-${task.state}-${task.updated_at}`,
-    title: task.state === 'IN_PROGRESS' ? '你的加油工单正在执行' : '你有新的待执行加油工单',
-    detail: `${task.flight_no} · ${task.gate} · 需油 ${task.fuel_needed.toLocaleString()} L${task.eta_minutes ? ` · 计划 ${task.eta_minutes} 分钟` : ''}`,
+    title: task.state === 'AWAITING_REVIEW' ? '差额已记录，等待调度确认' : task.state === 'IN_PROGRESS' ? '你的加油工单正在执行' : '你有新的待执行加油工单',
+    detail: task.state === 'AWAITING_REVIEW' ? `${task.flight_no} · 已加注 ${task.fuel_loaded.toLocaleString()} L · 剩余 ${task.remaining_fuel.toLocaleString()} L` : `${task.flight_no} · ${task.gate} · 需油 ${task.fuel_needed.toLocaleString()} L${task.eta_minutes ? ` · 计划 ${task.eta_minutes} 分钟` : ''}`,
     createdAt: task.updated_at,
-    tone: task.state === 'IN_PROGRESS' ? 'info' : 'success',
+    tone: task.state === 'AWAITING_REVIEW' ? 'warning' : task.state === 'IN_PROGRESS' ? 'info' : 'success',
     icon: <ClockCircleOutlined />
   })).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 8);
 }
@@ -88,7 +88,7 @@ export default function Notification() {
     if (!user?.role) return;
     try {
       const endpoint = user.role === 'DRIVER' ? '/driver/tasks' : '/overview';
-      const response = await fetch(`${API}${endpoint}`, { headers: apiHeaders() });
+      const response = await apiFetch(`${API}${endpoint}`, { headers: apiHeaders() });
       if (!response.ok) throw new Error('运行通知暂不可用');
       const payload = await response.json();
       setNotices(user.role === 'DRIVER' ? driverNotices(payload) : dispatcherNotices(payload));
@@ -122,7 +122,7 @@ export default function Notification() {
           <Transitions type="grow" position={downMD ? 'top' : 'top-right'} in={open} {...TransitionProps}>
             <Paper sx={(theme) => ({ boxShadow: theme.customShadows.z1, width: '100%', minWidth: 300, maxWidth: { xs: 320, md: 440 } })}>
               <ClickAwayListener onClickAway={handleClose}>
-                <MainCard title="运行通知与实时播报" elevation={0} border={false} content={false} secondary={unread > 0 ? <Tooltip title="全部标为已读"><IconButton color="success" size="small" onClick={markAllRead}><CheckCircleOutlined style={{ fontSize: '1.15rem' }} /></IconButton></Tooltip> : null}>
+                <MainCard title="运行通知" elevation={0} border={false} content={false} secondary={unread > 0 ? <Tooltip title="全部标为已读"><IconButton color="success" size="small" onClick={markAllRead}><CheckCircleOutlined style={{ fontSize: '1.15rem' }} /></IconButton></Tooltip> : null}>
                   {error ? <Alert severity="error" sx={{ m: 2 }}>{error}</Alert> : notices.length === 0 ? <Box sx={{ px: 2, py: 3 }}><Typography color="text.secondary" align="center">当前没有需要关注的航班或车辆运行情况。</Typography></Box> : <List component="nav" sx={{ p: 0, maxHeight: 420, overflow: 'auto', '& .MuiListItemButton-root': { py: 0.75, px: 2, '&.Mui-selected': { bgcolor: 'grey.50' }, '& .MuiAvatar-root': avatarSX } }}>
                     {notices.map((notice) => <ListItem key={notice.id} component={ListItemButton} divider selected={!readIds.has(notice.id)} onClick={() => setReadIds((previous) => new Set([...previous, notice.id]))} secondaryAction={<Typography variant="caption" noWrap>{formatTime(notice.createdAt)}</Typography>}>
                       <ListItemAvatar><Avatar sx={{ color: `${notice.tone}.main`, bgcolor: `${notice.tone}.lighter` }}>{notice.icon}</Avatar></ListItemAvatar>
