@@ -150,6 +150,10 @@ export default function DispatchConsole() {
   const [refuelling, setRefuelling] = useState(false);
   const [refuelTarget, setRefuelTarget] = useState(null);
   const [refuelError, setRefuelError] = useState('');
+  const [requestTarget, setRequestTarget] = useState(null);
+  const [requestReason, setRequestReason] = useState('');
+  const [requestError, setRequestError] = useState('');
+  const [requestSaving, setRequestSaving] = useState(false);
   const [activeSection, setActiveSection] = useState('overview');
   const [importing, setImporting] = useState(false);
   const [personnelFilter, setPersonnelFilter] = useState('');
@@ -300,6 +304,14 @@ export default function DispatchConsole() {
     } catch (err) { setAlertError(err.message); } finally { setResolvingAlert(false); }
   }
 
+  async function resolveRefuelRequest() {
+    setRequestSaving(true); setRequestError('');
+    try {
+      await command(`/refuel-requests/${requestTarget.id}/resolve`, { action: requestTarget.action, reason: requestReason });
+      setRequestTarget(null);
+    } catch (err) { setRequestError(err.message); } finally { setRequestSaving(false); }
+  }
+
   function openRefuel(vehicle, action) {
     setRefuelError('');
     setRefuelTarget({ vehicle, action });
@@ -442,6 +454,23 @@ export default function DispatchConsole() {
         {loadError && <Alert severity="error" action={<Button color="inherit" size="small" onClick={load}>重新连接</Button>}>{loadError}</Alert>}
         {error && <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" size="small" onClick={load}>重试</Button>}>{error}</Alert>}
         {message && <Alert severity="success" onClose={() => setMessage('')}>{message}</Alert>}
+        {data?.refuelRequests?.length > 0 && <Paper variant="outlined" sx={{ p: 2 }}><Stack spacing={1.5}>
+          <Typography variant="h6">司机补油申请（{data.refuelRequests.length}）</Typography>
+          {data.refuelRequests.map((request) => {
+            const vehicle = data.vehicles.find((v) => v.id === request.vehicle_id);
+            const occupied = data.tasks.some((task) => task.vehicle_id === request.vehicle_id && ['PENDING', 'IN_PROGRESS', 'AWAITING_REVIEW'].includes(task.state));
+            return <Box key={request.id} sx={{ borderTop: '1px solid', borderColor: 'divider', pt: 1 }}>
+              <Typography>{request.vehicle_code} · {request.driver_name} · {request.status === 'PENDING' ? '待处理' : '等待司机确认补油完成'}</Typography>
+              <Typography variant="body2">{request.reason}</Typography>
+              <Typography variant="caption" color="text.secondary">{new Date(request.created_at).toLocaleString('zh-CN')} · 系统油量 {vehicle?.fuel_level?.toLocaleString()} L{request.reported_fuel !== null ? ` · 司机上报 ${request.reported_fuel.toLocaleString()} L（仅供参考）` : ''}</Typography>
+              {request.status === 'PENDING' && <><Typography variant="body2" color="text.secondary">{occupied ? '车辆有未完成工单，请先完成作业或处理任务交接。' : '安排后暂停派工，补油完成由负责司机确认。'}</Typography><Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+                <Button variant="contained" disabled={occupied || vehicle?.status !== 'AVAILABLE'} onClick={() => { setRequestTarget({ ...request, action: 'approve' }); setRequestError(''); setRequestReason(''); }}>安排补油</Button>
+                <Button onClick={() => { setRequestTarget({ ...request, action: 'reject' }); setRequestError(''); setRequestReason(''); }}>退回申请</Button>
+              </Stack></>}
+            </Box>;
+          })}
+        </Stack></Paper>}
+
 
         {data && <>
           <Grid id="section-overview" container spacing={2} sx={{ scrollMarginTop: '148px' }}>
@@ -650,6 +679,14 @@ export default function DispatchConsole() {
         <DialogActions><Button onClick={() => setOverrideTask(null)} disabled={overrideSaving}>取消</Button><Button variant="contained" onClick={override} disabled={!selectedCandidate || !/^[1-9][0-9]*$/.test(plannedOrder) || overrideSaving}>{overrideSaving ? '保存中…' : '确认临时分配'}</Button></DialogActions>
       </Dialog>
 
+      <Dialog open={Boolean(requestTarget)} onClose={() => !requestSaving && setRequestTarget(null)} fullWidth maxWidth="xs">
+        <DialogTitle>{requestTarget?.action === 'approve' ? '安排补油' : '退回补油申请'} · {requestTarget?.vehicle_code}</DialogTitle>
+        <DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
+          {requestError && <Alert severity="error">{requestError}</Alert>}
+          {requestTarget?.action === 'approve' ? <Alert severity="info">确认后车辆前往补油点并暂停派工，等待负责司机确认补油完成。</Alert> : <TextField label="退回原因" multiline minRows={2} value={requestReason} onChange={(e) => setRequestReason(e.target.value)} helperText="填写 4 至 500 字，司机将看到此原因" inputProps={{ maxLength: 500 }} />}
+        </Stack></DialogContent>
+        <DialogActions><Button disabled={requestSaving} onClick={() => setRequestTarget(null)}>取消</Button><Button variant="contained" disabled={requestSaving || (requestTarget?.action === 'reject' && (requestReason.trim().length < 4 || requestReason.trim().length > 500))} onClick={resolveRefuelRequest}>{requestTarget?.action === 'approve' ? '确认安排' : '确认退回'}</Button></DialogActions>
+      </Dialog>
       <Dialog open={Boolean(refuelTarget)} onClose={() => !refuelling && setRefuelTarget(null)} fullWidth maxWidth="xs">
         <DialogTitle>{refuelTarget?.action === 'complete' ? '确认补油完成' : '安排车辆补油'} · {refuelTarget?.vehicle.code}</DialogTitle>
         <DialogContent><Stack spacing={1.5} sx={{ mt: 1 }}>

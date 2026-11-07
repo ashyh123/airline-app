@@ -31,7 +31,13 @@ export default function DriverWorkspace() {
   const [completeTask, setCompleteTask] = useState(null);
   const [fuelLoaded, setFuelLoaded] = useState('');
   const [refuelOpen, setRefuelOpen] = useState(false);
+  const [requestOpen, setRequestOpen] = useState(false);
+  const [requestReason, setRequestReason] = useState('');
+  const [reportedFuel, setReportedFuel] = useState('');
   const user = currentUser();
+  const refuelRequest = driver?.refuel_request;
+  const requestPending = ['PENDING', 'SCHEDULED'].includes(refuelRequest?.status);
+  const validReportedFuel = reportedFuel === '' || (/^\d+$/.test(reportedFuel) && Number(reportedFuel) <= (driver?.vehicle?.capacity ?? 0));
   const load = useCallback(async () => {
     try {
       const response = await apiFetch(`${API}/driver/tasks`, { headers: apiHeaders() });
@@ -55,6 +61,15 @@ export default function DriverWorkspace() {
       if (!response.ok) throw new Error(data.error);
       setMessage(data.message); setExceptionTask(null); setCompleteTask(null); setReason(''); setFuelLoaded('');
       await load();
+    } catch (err) { setActionError(err.message); } finally { setSubmitting(false); }
+  }
+  async function requestRefuel() {
+    setSubmitting(true); setActionError('');
+    try {
+      const response = await apiFetch(`${API}/driver/refuel-requests`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify({ reason: requestReason, reportedFuel: reportedFuel === '' ? null : Number(reportedFuel) }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error);
+      setMessage(result.message); setRequestOpen(false); await load();
     } catch (err) { setActionError(err.message); } finally { setSubmitting(false); }
   }
   async function completeRefuel() {
@@ -88,6 +103,11 @@ export default function DriverWorkspace() {
     {actionError && !exceptionTask && !completeTask && <Alert severity="error">{actionError}</Alert>}
     {message && <Alert severity="success" onClose={() => setMessage('')}>{message}</Alert>}
     {statusBanner()}
+    {refuelRequest && <Alert severity={refuelRequest.status === 'REJECTED' ? 'warning' : 'info'}>
+      补油申请：{{ PENDING: '待调度处理', SCHEDULED: '已安排补油', REJECTED: '已退回', CANCELLED: '已取消', COMPLETED: '已完成' }[refuelRequest.status]} · {refuelRequest.reason}
+      {refuelRequest.resolution && <Typography variant="body2">{refuelRequest.resolution}</Typography>}
+    </Alert>}
+    {driver?.eligible && !['REFUELLING', 'MAINTENANCE'].includes(driver.vehicle?.status) && <Box><Button variant="outlined" disabled={submitting || requestPending} onClick={() => { setRequestReason(''); setReportedFuel(''); setActionError(''); setRequestOpen(true); }}>{requestPending ? '补油申请待调度处理' : '申请补油'}</Button></Box>}
     {(!driver?.eligible || tasks.length === 0) && <Paper variant="outlined" sx={{ p: 4, textAlign: 'center' }}><Typography variant="h6">当前没有待处理工单</Typography><Typography color="text.secondary" sx={{ mt: 1 }}>当前状态：{WORK_LABEL[driver?.work_status] ?? '未知'}。新工单下发后会显示在这里。</Typography></Paper>}
     {driver?.eligible && tasks.map((task) => {
       const [label, color] = labels[task.state] ?? [task.state, 'default'];
@@ -104,6 +124,16 @@ export default function DriverWorkspace() {
         </Stack>
       </Stack></Paper>;
     })}
+    <Dialog open={requestOpen} onClose={() => !submitting && setRequestOpen(false)} fullWidth maxWidth="xs">
+      <DialogTitle>申请补油 · {driver?.vehicle?.code}</DialogTitle>
+      <DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
+        <Alert severity="info">提交后等待调度安排，车辆状态和现有工单保持不变。现场油量仅供调度参考，不会直接覆盖系统油量。</Alert>
+        {actionError && <Alert severity="error">{actionError}</Alert>}
+        <TextField label="补油原因" multiline minRows={2} value={requestReason} onChange={(e) => setRequestReason(e.target.value)} helperText="填写 4 至 500 字" inputProps={{ maxLength: 500 }} />
+        <TextField label="现场剩余油量（L，可选）" value={reportedFuel} onChange={(e) => setReportedFuel(e.target.value)} error={!validReportedFuel} helperText={`请输入 0 至 ${driver?.vehicle?.capacity ?? 0} 的整数`} inputProps={{ inputMode: 'numeric' }} />
+      </Stack></DialogContent>
+      <DialogActions><Button disabled={submitting} onClick={() => setRequestOpen(false)}>取消</Button><Button variant="contained" disabled={submitting || requestReason.trim().length < 4 || requestReason.trim().length > 500 || !validReportedFuel} onClick={requestRefuel}>提交补油申请</Button></DialogActions>
+    </Dialog>
     <Dialog open={refuelOpen} onClose={() => !submitting && setRefuelOpen(false)} fullWidth maxWidth="xs">
       <DialogTitle>确认补油完成 · {driver?.vehicle?.code}</DialogTitle>
       <DialogContent><Stack spacing={2} sx={{ mt: 1 }}><Alert severity="warning">请确认已在现场补满油。提交后按车辆容量记录油量，并恢复调度。</Alert>{actionError && <Alert severity="error">{actionError}</Alert>}</Stack></DialogContent>

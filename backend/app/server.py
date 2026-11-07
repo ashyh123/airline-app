@@ -143,6 +143,14 @@ CREATE TABLE IF NOT EXISTS users (
   work_status TEXT, password_hash TEXT, must_change INTEGER NOT NULL DEFAULT 0,
   created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS refuel_requests (
+  id TEXT PRIMARY KEY, vehicle_id TEXT NOT NULL REFERENCES vehicles(id),
+  driver_id TEXT NOT NULL REFERENCES users(id), reason TEXT NOT NULL,
+  reported_fuel INTEGER, status TEXT NOT NULL DEFAULT 'PENDING',
+  resolution TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_refuel_request
+  ON refuel_requests(vehicle_id) WHERE status IN ('PENDING','SCHEDULED');
 CREATE TABLE IF NOT EXISTS operation_logs (
   id TEXT PRIMARY KEY, actor_id TEXT, actor_name TEXT, action TEXT NOT NULL,
   target_type TEXT, target_id TEXT, target_name TEXT,
@@ -561,6 +569,9 @@ def overview(db: sqlite3.Connection) -> dict:
         "resting": sum(p["role"] == "DRIVER" and p["work_status"] == "RESTING" for p in personnel),
     }
     return {
+        "refuelRequests": rows(db, """SELECT r.*, v.code vehicle_code, u.display_name driver_name
+            FROM refuel_requests r JOIN vehicles v ON v.id=r.vehicle_id JOIN users u ON u.id=r.driver_id
+            WHERE r.status IN ('PENDING','SCHEDULED') ORDER BY r.created_at"""),
         "stats": stats, "tasks": active, "vehicles": vehicles, "flights": flights,
         "alerts": alerts, "broadcasts": broadcasts, "recentResolutions": recent_resolutions,
         "personnel": personnel, "personnelCounts": personnel_counts,
@@ -696,6 +707,12 @@ class Handler(BaseHTTPRequestHandler):
                 if path.startswith("/api/vehicles/") and path.endswith("/refuel"):
                     dispatcher = self._authorize(db, "DISPATCHER", "DRIVER")
                     self._refuel_vehicle(db, path.split("/")[3], payload, dispatcher)
+                    return
+                if path == "/api/driver/refuel-requests":
+                    self._request_refuel(db, payload, self._authorize(db, "DRIVER"))
+                    return
+                if path.startswith("/api/refuel-requests/") and path.endswith("/resolve"):
+                    self._resolve_refuel_request(db, path.split("/")[3], payload, self._authorize(db, "DISPATCHER"))
                     return
                 if path == "/api/admin/flights/import":
                     self._authorize(db, "DISPATCHER")
@@ -842,6 +859,7 @@ class Handler(BaseHTTPRequestHandler):
                 "account_status": user["account_status"],
                 "vehicle": dict(vehicle) if vehicle else None,
                 "eligible": eligible,
+                "refuel_request": next(iter(rows(db, "SELECT * FROM refuel_requests WHERE driver_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1", (user["id"],))), None),
             },
         }
 
@@ -1062,8 +1080,8 @@ class Handler(BaseHTTPRequestHandler):
         old_driver = db.execute("SELECT * FROM users WHERE vehicle_id=?", (task["vehicle_id"],)).fetchone()
         driver = db.execute("SELECT * FROM users WHERE id=?", (choice["driverId"],)).fetchone()
         if old_driver and old_driver["id"] != driver["id"]:
-            db.execute("UPDATE users SET vehicle_id=NULL, work_status='STANDBY' WHERE id=?", (old_driver["id"],))
-            db.execute("UPDATE vehicles SET driver='', updated_at=? WHERE id=?", (now(), old_driver["vehicle_id"]))
+            self._unbind_vehicle(db, old_driver)
+            db.execute("UPDATE users SET work_status='STANDBY' WHERE id=?", (old_driver["id"],))
         if driver["vehicle_id"] and driver["vehicle_id"] != choice["vehicleId"]:
             self._unbind_vehicle(db, driver)
         db.execute("UPDATE users SET vehicle_id=?, work_status='ON_DUTY' WHERE id=?", (choice["vehicleId"], driver["id"]))
@@ -1153,6 +1171,44 @@ class Handler(BaseHTTPRequestHandler):
         log_operation(db, actor, "确认风险并记录", "预警", alert_id, alert_id, after="ACKNOWLEDGED", reason=resolution)
         self._send({"message": "已确认并记录风险，约束尚未解除；系统将持续跟踪", "overview": overview(db)})
 
+    def _request_refuel(self, db: sqlite3.Connection, payload: dict, driver: sqlite3.Row) -> None:
+        if driver["work_status"] != "ON_DUTY" or not driver["vehicle_id"]:
+            raise PermissionError("只有绑定车辆的值班司机可以申请补油")
+        vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["vehicle_id"],)).fetchone()
+        if vehicle["status"] in {"REFUELLING", "MAINTENANCE"}:
+            raise ValueError("车辆正在补油或维修，不能重复申请补油")
+        if db.execute("SELECT 1 FROM refuel_requests WHERE vehicle_id=? AND status IN ('PENDING','SCHEDULED')", (vehicle["id"],)).fetchone():
+            raise ValueError("该车已有待处理的补油申请，请等待调度处理")
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not 4 <= len(reason.strip()) <= 500:
+            raise ValueError("请填写 4 至 500 字的补油原因")
+        fuel = payload.get("reportedFuel")
+        if fuel is not None and (type(fuel) is not int or not 0 <= fuel <= vehicle["capacity"]):
+            raise ValueError("现场剩余油量须为不超过车辆容量的非负整数")
+        identifier = str(uuid.uuid4())
+        db.execute("INSERT INTO refuel_requests (id,vehicle_id,driver_id,reason,reported_fuel,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                   (identifier, vehicle["id"], driver["id"], reason.strip(), fuel, now(), now()))
+        log_operation(db, driver, "申请补油", "加油车", vehicle["id"], vehicle["code"], after="PENDING", reason=reason.strip())
+        self._send({"message": "补油申请已提交，请等待调度安排；当前工单保持不变", **self._driver_tasks(db, driver)})
+
+    def _resolve_refuel_request(self, db: sqlite3.Connection, identifier: str, payload: dict, actor: sqlite3.Row) -> None:
+        request = db.execute("SELECT * FROM refuel_requests WHERE id=?", (identifier,)).fetchone()
+        if not request or request["status"] != "PENDING":
+            raise ValueError("申请不存在或已处理，请刷新")
+        action = payload.get("action")
+        if action == "approve":
+            owner = db.execute("SELECT * FROM users WHERE id=?", (request["driver_id"],)).fetchone()
+            if owner["vehicle_id"] != request["vehicle_id"] or owner["work_status"] != "ON_DUTY" or owner["account_status"] != "ENABLED":
+                raise ValueError("申请人已不再负责该车辆，请退回申请")
+            self._refuel_vehicle(db, request["vehicle_id"], {"action": "start"}, actor)
+            return
+        reason = payload.get("reason")
+        if action != "reject" or not isinstance(reason, str) or not 4 <= len(reason.strip()) <= 500:
+            raise ValueError("退回申请须填写 4 至 500 字的原因")
+        db.execute("UPDATE refuel_requests SET status='REJECTED',resolution=?,updated_at=? WHERE id=?", (reason.strip(), now(), identifier))
+        log_operation(db, actor, "退回补油申请", "加油车", request["vehicle_id"], request["vehicle_id"], after="REJECTED", reason=reason.strip())
+        self._send({"message": "已退回补油申请并告知司机", "overview": overview(db)})
+
     def _refuel_vehicle(self, db: sqlite3.Connection, vehicle_id: str, payload: dict, dispatcher: sqlite3.Row) -> None:
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
         if not vehicle:
@@ -1177,6 +1233,7 @@ class Handler(BaseHTTPRequestHandler):
             if vehicle["fuel_level"] >= vehicle["capacity"]:
                 raise ValueError("该车辆已满油，无需安排补油")
             db.execute("UPDATE vehicles SET status='REFUELLING', updated_at=? WHERE id=?", (now(), vehicle_id))
+            db.execute("UPDATE refuel_requests SET status='SCHEDULED',resolution='调度已安排补油',updated_at=? WHERE vehicle_id=? AND status='PENDING'", (now(), vehicle_id))
             log_operation(db, dispatcher, "安排补油", "加油车", vehicle_id, vehicle["code"],
                           before=before, after=f"状态=REFUELLING 目的地={REFUEL_POINT['name']} 油量未变")
             self._send({"message": f"已安排 {vehicle['code']} 前往{REFUEL_POINT['name']}，请在现场补油完成后确认", "overview": overview(db)})
@@ -1192,6 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                WHERE type='VEHICLE_LOW_FUEL' AND related_id=? AND resolved=0""",
             (now(), vehicle_id),
         )
+        db.execute("UPDATE refuel_requests SET status='COMPLETED',resolution='司机已确认补油完成',updated_at=? WHERE vehicle_id=? AND status='SCHEDULED'", (now(), vehicle_id))
         log_operation(db, dispatcher, "确认补油完成", "加油车", vehicle_id, vehicle["code"],
                       before=before, after=f"状态=AVAILABLE 油量={vehicle['capacity']:,}/{vehicle['capacity']:,} L 位置={REFUEL_POINT['name']}")
         broadcast(db, "INFO", "加油车已完成补油", f"{vehicle['code']} 已在{REFUEL_POINT['name']}完成补油并重新参与调度。")
@@ -1458,6 +1516,7 @@ class Handler(BaseHTTPRequestHandler):
         vehicle = db.execute("SELECT status FROM vehicles WHERE id=?", (driver["vehicle_id"],)).fetchone()
         if vehicle and vehicle["status"] == "REFUELLING":
             raise ValueError("负责车辆正在补油，请由当前司机确认完成后再交接")
+        db.execute("UPDATE refuel_requests SET status='CANCELLED',resolution='司机车辆绑定已变更，请由当前负责司机重新申请',updated_at=? WHERE driver_id=? AND status='PENDING'", (now(), driver["id"]))
         db.execute("UPDATE users SET vehicle_id=NULL WHERE id=?", (driver["id"],))
         db.execute("UPDATE vehicles SET driver='', updated_at=? WHERE id=?", (now(), driver["vehicle_id"]))
 
