@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -123,8 +124,10 @@ class HTTPScenario(unittest.TestCase):
         return next(task for task in data["tasks"] if task["flight_id"] == flight_id and task["state"] == "PENDING")
 
     def fill_unbound_truck(self) -> dict:
-        self.post("/vehicles/v4/refuel", {"action": "start"})
-        return self.post("/vehicles/v4/refuel", {"action": "complete"})["overview"]
+        # Stock-only fixture for candidate tests; real refuelling has its own HTTP lifecycle test.
+        with sqlite3.connect(Path(self.tmp.name) / "dispatch.db") as db:
+            db.execute("UPDATE vehicles SET fuel_level=capacity WHERE id='v4'")
+        return self.overview()
 
     def create_driver(self, suffix: str, standby: bool = True, enabled: bool = True) -> str:
         created = self.request("POST", "/admin/personnel", {
@@ -152,39 +155,38 @@ class HTTPScenario(unittest.TestCase):
 
 class DispatchHTTPTests(HTTPScenario):
     def test_refuel_is_a_two_step_dispatch_not_instant_fuel(self) -> None:
-        initial = self.overview()
-        vehicle = self.vehicle(initial, "v4")
-        self.assertGreater(vehicle["fuel_level"] / vehicle["capacity"], 0.2)
-        self.assertLess(vehicle["fuel_level"], min(f["fuel_needed"] for f in initial["flights"]))
-        sent = self.post("/vehicles/v4/refuel", {"action": "start"})["overview"]
-        self.assertEqual(self.vehicle(sent, "v4")["status"], "REFUELLING")
-        self.assertEqual(self.vehicle(sent, "v4")["fuel_level"], vehicle["fuel_level"])
+        for flight in ['f1', 'f2', 'f4', 'f5']:
+            self.post('/events', {'eventId': 'cancel-'+flight, 'flightId': flight, 'type': 'CANCELLED'})
+        vehicle = self.vehicle(self.overview(), 'v1')
+        sent = self.post('/vehicles/v1/refuel', {'action': 'start'})['overview']
+        self.assertEqual(self.vehicle(sent, 'v1')['status'], 'REFUELLING')
+        self.assertEqual(self.vehicle(sent, 'v1')['fuel_level'], vehicle['fuel_level'])
         self.optimize()
-        self.assertFalse(any(t["vehicle_id"] == "v4" and t["state"] in {"PENDING", "IN_PROGRESS"} for t in self.overview()["tasks"]))
-        done = self.post("/vehicles/v4/refuel", {"action": "complete"})["overview"]
-        point = done["refuelPoint"]
-        completed = self.vehicle(done, "v4")
-        actual = {
-            "before": {"status": vehicle["status"], "fuel": vehicle["fuel_level"]},
-            "sent": {"status": self.vehicle(sent, "v4")["status"], "fuel": self.vehicle(sent, "v4")["fuel_level"]},
-            "completed": {"status": completed["status"], "fuel": completed["fuel_level"],
-                          "atRefuelPoint": (completed["x"], completed["y"]) == (point["x"], point["y"])},
-        }
-        expected = json.loads((Path(__file__).parent / "fixtures/refuel-lifecycle.json").read_text())
-        self.assertEqual(actual, expected)
-        EVIDENCE["refuel_lifecycle"] = actual
+        self.assertFalse(any(t['vehicle_id']=='v1' and t['state'] in {'PENDING','IN_PROGRESS'} for t in self.overview()['tasks']))
+        response = self.request('POST', '/vehicles/v1/refuel', {'action':'complete'}, auth=self.driver)
+        self.assertNotIn('overview', response)
+        done = self.overview()
+        completed = self.vehicle(done, 'v1')
+        self.assertEqual(completed['fuel_level'], completed['capacity'])
+        self.assertEqual(completed['status'], 'AVAILABLE')
+        self.assertEqual((completed['x'],completed['y']), (done['refuelPoint']['x'],done['refuelPoint']['y']))
+        EVIDENCE['refuel_lifecycle'] = {'dispatcher_start':True, 'driver_complete':True, 'fuel_unchanged_until_completion':True}
 
     def test_refuel_rejects_wrong_role_invalid_state_and_active_work(self) -> None:
-        self.request("POST", "/vehicles/v4/refuel", {"action": "start"}, auth=self.driver, status=403)
-        self.post("/vehicles/v4/refuel", {"action": "complete"}, status=422)
-        self.post("/vehicles/v3/refuel", {"action": "start"}, status=422)
-        self.post("/vehicles/v5/refuel", {"action": "start"}, status=422)
-        self.post("/vehicles/v4/refuel", {"action": "start"})
-        self.post("/vehicles/v4/refuel", {"action": "start"}, status=422)
-        self.post("/vehicles/v4/refuel", {"action": "complete"})
-        self.post("/vehicles/v4/refuel", {"action": "complete"}, status=422)
-        self.post("/vehicles/v4/refuel", {"action": "start"}, status=422)
-        EVIDENCE["refuel_guards"] = {"driver": 403, "invalid_or_duplicate": 422, "active_work": 422, "maintenance": 422}
+        self.request('POST','/vehicles/v1/refuel',{'action':'start'},auth=self.driver,status=403)
+        self.post('/vehicles/v1/refuel',{'action':'complete'},status=403)
+        self.request('POST','/vehicles/v1/refuel',{'action':'complete'},auth=self.driver,status=422)
+        self.post('/vehicles/v4/refuel',{'action':'start'},status=422)
+        self.post('/vehicles/v3/refuel',{'action':'start'},status=422)
+        self.post('/vehicles/v1/refuel',{'action':'start'})
+        self.post('/vehicles/v1/refuel',{'action':'start'},status=422)
+        other = self.login('driver02','driver123')
+        self.request('POST','/vehicles/v1/refuel',{'action':'complete'},auth=other,status=403)
+        self.post('/dispatch/personnel/driver-v1/status',{'status':'STANDBY','reason':'测试交班'},status=422)
+        self.request('POST','/admin/personnel/driver-v1/disable',{},auth=self.admin,status=422)
+        self.request('POST','/vehicles/v1/refuel',{'action':'complete'},auth=self.driver)
+        self.request('POST','/vehicles/v1/refuel',{'action':'complete'},auth=self.driver,status=422)
+        EVIDENCE['refuel_guards'] = {'dispatcher_complete':403,'other_driver':403,'unbind_while_refuelling':422,'unbound_start':422}
 
     def test_candidates_filter_constraints_and_sort_schematic_journeys(self) -> None:
         standby = self.create_driver("standby")
@@ -414,10 +416,13 @@ class DispatchHTTPTests(HTTPScenario):
         self.assertFalse(any(t["flight_id"] == tiny["id"] and t["state"] in {"PENDING", "IN_PROGRESS"} for t in data["tasks"]))
         self.assertTrue(any(a["type"] == "VEHICLE_LOW_FUEL" and a["related_id"] == "v1" for a in data["alerts"]))
         self.post("/dispatch/personnel/driver-v1/status", {"status": "STANDBY", "reason": "补油候命"})
-        self.post("/dispatch/personnel/driver-v1/call", {"vehicleId": "v1"}, status=422)
+        self.post("/dispatch/personnel/driver-v1/call", {"vehicleId": "v1"})
+        self.assertFalse(any(t['flight_id']==tiny['id'] and t['state']=='PENDING' for t in self.optimize()['tasks']))
+        self.post('/vehicles/v1/refuel', {'action':'start'})
+        self.request('POST','/vehicles/v1/refuel',{'action':'complete'},auth=self.driver)
         EVIDENCE["safety_threshold"] = {"enough_for_small_flight_but_below_twenty_percent": True,
                                          "automatic_dispatch_blocked": True, "low_fuel_alert": True,
-                                         "temporary_call_blocked": 422}
+                                         "binding_for_refuel_allowed_but_dispatch_blocked": True}
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@
 
 | 角色 | 可用功能 |
 | --- | --- |
-| 调度人员 | 查看全场态势、生成智能方案、人工改派和锁定工单、处置风险预警、导入航班数据、安排及确认补油、临时分配待执行工单；管理当班人员：查看三态分布、办理值班 / 休闲 / 休息流转（须填原因）、临时调用（绑车转值班）、带待执行工单更换车辆。不能代替司机提交作业状态。 |
+| 调度人员 | 查看全场态势、生成智能方案、人工改派和锁定工单、处置风险预警、导入航班数据、安排补油（由负责司机确认完成）、临时分配待执行工单；管理当班人员：查看三态分布、办理值班 / 休闲 / 休息流转（须填原因）、临时调用（绑车转值班）、带待执行工单更换车辆。不能代替司机提交作业状态。 |
 | 加油人员 | 查看本人工作状态横幅（值班 / 休闲 / 休息 + 负责车辆与油量）与待办、进行中工单；可上报开始、完成（须提交本次加注量，剩余油量由系统折算）和带原因的异常。休息或非值班状态下不会收到新工单。 |
 | 系统管理员 | 人员与账号管理：创建调度员 / 加油员账号并分配角色权限、编辑资料、重置密码、停用 / 启用账号，以及查看操作审计所需的接口数据。 |
 
@@ -68,7 +68,7 @@ A-OCS / 模拟事件 ──POST /api/events──> 调度服务
 | `POST /api/dispatch/personnel/{id}/status` | 调度 | 值班→休闲 / 休息（须无活动工单并填原因；休息不能直接转值班） |
 | `POST /api/dispatch/personnel/{id}/call` | 调度 | 临时调用：为休闲人员绑定可用车辆并转值班 |
 | `POST /api/dispatch/personnel/{id}/vehicle` | 调度 | 值班人员带待执行工单更换绑定车辆；作业中不可直接更换 |
-| `POST /api/vehicles/{id}/refuel` | 调度 | `action: "start"` 安排补油，`action: "complete"` 确认完成；完成后闭环油量告警并重新调度 |
+| `POST /api/vehicles/{id}/refuel` | 调度 / 负责司机 | 调度以 `action: "start"` 安排补油；负责该车的值班司机以 `action: "complete"` 确认完成；完成后闭环油量告警并重新调度 |
 | `GET /api/driver/tasks`、`POST /api/tasks/{id}/progress` | 司机 | 本人工单查询与进度上报（完成须带 `fuelLoaded` 本次加注量；返回含本人工作状态） |
 
 ## 本次工作台调整与验证
@@ -128,3 +128,5 @@ POST /api/events
 前端基于 [Mantis Free React Material UI Dashboard Template](https://github.com/codedthemes/mantis-free-react-admin-template) 的 Vite 结构、主题与通用布局进行二次开发；该项目为 MIT License，原许可证保留在 `frontend/LICENSE`。
 
 生产调度建议采用 [Google OR-Tools](https://github.com/google/or-tools) 的车辆路径求解能力（Apache-2.0）；本原型的 `Scheduler` 接口已为此预留替换位置。没有直接复制 OR-Tools 代码。
+
+司机补油确认与 CSV 导入修复详见 [更新说明](docs/driver-refuel-and-import-fix.md)。文件解析回归：`node --test frontend/tests/flightImport.test.mjs`。

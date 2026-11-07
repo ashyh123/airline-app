@@ -38,6 +38,7 @@ import {
 import { apiFetch, apiHeaders, currentUser } from 'utils/auth';
 import ApronMap from './ApronMap';
 import FlightPlan from './FlightPlan';
+import { parseFlightFile } from 'utils/flightImport';
 
 const API = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8080/api';
 const example = `flightNo,gate,departureAt,fuelNeeded,priority,x,y\nCA2026,E08,${new Date(Date.now() + 86400000).toISOString()},6800,2,14,9`;
@@ -82,11 +83,6 @@ const SECTIONS = [
   { id: 'personnel', label: '当班人员', icon: <TeamOutlined /> },
   { id: 'import', label: '航班导入', icon: <ImportOutlined /> }
 ];
-
-function csvRows(text) {
-  const [header, ...lines] = text.trim().split(/\r?\n/); const keys = header.split(',').map((cell) => cell.trim());
-  return lines.filter(Boolean).map((line) => Object.fromEntries(keys.map((key, index) => [key, line.split(',')[index]?.trim()])));
-}
 
 function StateChip({ value }) {
   const [label, color] = stateStyle[value] ?? [value, 'default'];
@@ -247,7 +243,7 @@ export default function DispatchConsole() {
     setImportPreview({ name: file.name, flights: [], rows: [], valid: 0, applied: false });
     try {
       const content = await file.text();
-      const flights = file.name.toLowerCase().endsWith('.json') ? JSON.parse(content) : csvRows(content);
+      const flights = parseFlightFile(file.name, content);
       const response = await apiFetch(`${API}/admin/flights/import`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify({ flights, preview: true }) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error ?? '无法预览导入文件');
@@ -519,7 +515,7 @@ export default function DispatchConsole() {
                         <Typography variant="caption">{vehicle.fuel_level.toLocaleString()} / {vehicle.capacity.toLocaleString()} L</Typography>
                         <StateChip value={vehicle.status} />
                         {vehicle.status === 'AVAILABLE' && vehicle.fuel_level < vehicle.capacity && <Button size="small" variant="outlined" color="warning" disabled={refuelling} onClick={() => openRefuel(vehicle, 'start')}>安排补油</Button>}
-                        {vehicle.status === 'REFUELLING' && <Button size="small" variant="outlined" color="success" disabled={refuelling} onClick={() => openRefuel(vehicle, 'complete')}>确认补油完成</Button>}
+                        {vehicle.status === 'REFUELLING' && <Typography variant="caption" color="warning.main">等待负责司机确认补油完成</Typography>}
                       </Stack>
                     </Stack>
                     <LinearProgress variant="determinate" value={Math.round(vehicle.fuel_level / vehicle.capacity * 100)} color={vehicle.fuel_level / vehicle.capacity < .35 ? 'warning' : 'primary'} />
@@ -597,9 +593,9 @@ export default function DispatchConsole() {
         <DialogContent><Stack spacing={1.5} sx={{ mt: 1 }}>
           {importing && <LinearProgress />}
           {importError && <Alert severity="error">{importError}</Alert>}
-          {importPreview?.applied ? <Alert severity="success">已应用 {importPreview.imported} 条记录；拒绝 {importPreview.rejected?.length ?? 0} 条。失败记录未写入。</Alert> : <Alert severity="info">当前只做校验，尚未写入。确认时会再次检查活动工单和字段约束。</Alert>}
+          {importPreview?.applied ? <Alert severity="success">已应用 {importPreview.imported} 条记录；拒绝 {importPreview.rejected?.length ?? 0} 条。失败记录未写入。已过离港时间的航班请在“航班计划 → 历史与已结束”中查看。</Alert> : <Alert severity="info">当前只做校验，尚未写入。确认时会再次检查活动工单和字段约束。</Alert>}
           <Typography variant="body2">新增 {importPreview?.rows.filter((row) => row.action === 'CREATE').length ?? 0} · 更新 {importPreview?.rows.filter((row) => row.action === 'UPDATE').length ?? 0} · 拒绝 {importPreview?.rows.filter((row) => row.action === 'REJECT').length ?? 0}</Typography>
-          <Box sx={{ maxHeight: 380, overflow: 'auto' }}><Table size="small"><TableHead><TableRow><TableCell>数据行</TableCell><TableCell>航班</TableCell><TableCell>结果</TableCell><TableCell>原因</TableCell></TableRow></TableHead><TableBody>{importPreview?.rows.map((row) => <TableRow key={row.row}><TableCell>{row.row}</TableCell><TableCell>{row.flightNo || '未填写'}</TableCell><TableCell><Chip size="small" color={row.action === 'REJECT' ? 'error' : 'success'} variant="outlined" label={{ CREATE: '新增', UPDATE: '更新', REJECT: '拒绝' }[row.action]} /></TableCell><TableCell>{row.error || '校验通过'}</TableCell></TableRow>)}</TableBody></Table></Box>
+          <Box sx={{ maxHeight: 380, overflow: 'auto' }}><Table size="small"><TableHead><TableRow><TableCell>数据行</TableCell><TableCell>航班</TableCell><TableCell>结果</TableCell><TableCell>原因</TableCell></TableRow></TableHead><TableBody>{importPreview?.rows.map((row) => <TableRow key={row.row}><TableCell>{row.row}</TableCell><TableCell>{row.flightNo || '未填写'}</TableCell><TableCell><Chip size="small" color={row.action === 'REJECT' ? 'error' : 'success'} variant="outlined" label={{ CREATE: '新增', UPDATE: '更新', REJECT: '拒绝' }[row.action]} /></TableCell><TableCell>{row.error || row.warning || '校验通过'}</TableCell></TableRow>)}</TableBody></Table></Box>
         </Stack></DialogContent>
         <DialogActions><Button disabled={importing} onClick={() => setImportPreview(null)}>{importPreview?.applied ? '关闭' : '取消'}</Button>{!importPreview?.applied && <Button variant="contained" disabled={importing || !importPreview?.valid} onClick={applyImport}>确认导入 {importPreview?.valid ?? 0} 条有效记录</Button>}</DialogActions>
       </Dialog>
@@ -659,7 +655,7 @@ export default function DispatchConsole() {
         <DialogContent><Stack spacing={1.5} sx={{ mt: 1 }}>
           {refuelError && <Alert severity="error">{refuelError}</Alert>}
           <Typography variant="body2">当前油量 {refuelTarget?.vehicle.fuel_level.toLocaleString()} / {refuelTarget?.vehicle.capacity.toLocaleString()} L。</Typography>
-          {refuelTarget?.action === 'complete' ? <Alert severity="warning">请确认车辆已在补油点完成补油。确认后按满容记录油量、关闭油量告警并恢复可用，系统将重新生成调度方案。</Alert> : <Alert severity="info">将安排车辆前往{data?.refuelPoint?.name ?? '补油点'}，期间标记为“补油中”并暂停派工。当前油量保持不变，实际补油后还需确认完成。</Alert>}
+          {refuelTarget?.action === 'complete' ? <Alert severity="warning">请确认车辆已在补油点完成补油。确认后按满容记录油量、关闭油量告警并恢复可用，系统将重新生成调度方案。</Alert> : <Alert severity="info">将安排车辆前往{data?.refuelPoint?.name ?? '补油点'}，期间标记为“补油中”并暂停派工。当前油量保持不变，实际补油后由负责司机在司机工作台确认完成。</Alert>}
         </Stack></DialogContent>
         <DialogActions><Button onClick={() => setRefuelTarget(null)} disabled={refuelling}>取消</Button><Button variant="contained" onClick={confirmRefuel} disabled={refuelling}>{refuelling ? '处理中…' : refuelTarget?.action === 'complete' ? '确认已补满' : '确认安排补油'}</Button></DialogActions>
       </Dialog>
@@ -674,7 +670,7 @@ export default function DispatchConsole() {
             {handlingAlert?.details?.suggestion && <Alert severity="info">{handlingAlert.details.suggestion}</Alert>}
             {handlingAlert?.alert?.type === 'VEHICLE_LOW_FUEL' ? (
               <Alert severity="warning" action={<Button color="inherit" size="small" disabled={refuelling || handlingAlert?.details?.vehicle?.status !== 'AVAILABLE'} onClick={() => openRefuel(handlingAlert.details.vehicle, 'start')}>安排补油</Button>}>
-                {handlingAlert?.details?.vehicle ? `${handlingAlert.details.vehicle.code} 当前油量 ${handlingAlert.details.vehicle.fuel_level.toLocaleString()} / ${handlingAlert.details.vehicle.capacity.toLocaleString()} L。` : ''}{handlingAlert?.details?.vehicle?.status === 'REFUELLING' ? '该车辆正在补油，请在“加油车资源”中确认补油完成后恢复派工。' : '请安排可用车辆前往补油点；车辆补油期间暂停派工，确认完成后关闭告警并重新参与调度。'}
+                {handlingAlert?.details?.vehicle ? `${handlingAlert.details.vehicle.code} 当前油量 ${handlingAlert.details.vehicle.fuel_level.toLocaleString()} / ${handlingAlert.details.vehicle.capacity.toLocaleString()} L。` : ''}{handlingAlert?.details?.vehicle?.status === 'REFUELLING' ? '该车辆正在补油，请由负责该车的司机在司机工作台确认完成。' : '请安排可用车辆前往补油点；车辆补油期间暂停派工，确认完成后关闭告警并重新参与调度。'}
               </Alert>
             ) : <>
               <Typography variant="subtitle2">可协调资源</Typography>

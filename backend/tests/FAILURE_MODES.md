@@ -81,5 +81,6 @@ python3 -m unittest discover -s backend/tests -v
 `DISPATCH_TEST_OUTPUT_DIR` optionally chooses the run-artifact directory. The
 default is a new temporary directory retained after the run. The normalized
 `result-manifest.json` contains semantic evidence, without tokens, generated IDs,
-passwords, or timestamps. The replenishment lifecycle is also compared against
-the checked-in fixture in `fixtures/refuel-lifecycle.json`.
+passwords, or timestamps. The replenishment lifecycle checks dispatcher start, owner-driver completion,
+unchanged fuel before confirmation, and rejection of another driver or dispatcher.
+Candidate tests use a separately stocked truck fixture.

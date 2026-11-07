@@ -30,6 +30,7 @@ export default function DriverWorkspace() {
   const [reason, setReason] = useState('');
   const [completeTask, setCompleteTask] = useState(null);
   const [fuelLoaded, setFuelLoaded] = useState('');
+  const [refuelOpen, setRefuelOpen] = useState(false);
   const user = currentUser();
   const load = useCallback(async () => {
     try {
@@ -56,6 +57,15 @@ export default function DriverWorkspace() {
       await load();
     } catch (err) { setActionError(err.message); } finally { setSubmitting(false); }
   }
+  async function completeRefuel() {
+    setSubmitting(true); setActionError('');
+    try {
+      const response = await apiFetch(`${API}/vehicles/${driver.vehicle.id}/refuel`, { method: 'POST', headers: apiHeaders(true), body: JSON.stringify({ action: 'complete' }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error);
+      setMessage(result.message); setRefuelOpen(false); await load();
+    } catch (err) { setActionError(err.message); } finally { setSubmitting(false); }
+  }
   function openComplete(task) {
     setActionError(''); setReason(''); setCompleteTask(task); setFuelLoaded(String(task.fuel_needed));
   }
@@ -66,7 +76,7 @@ export default function DriverWorkspace() {
   function statusBanner() {
     if (!driver) return null;
     if (driver.account_status !== 'ENABLED') return <Alert severity="error">账号已被停用，请联系系统管理员。</Alert>;
-    if (driver.vehicle?.status === 'REFUELLING') return <Alert severity="warning" variant="outlined">负责车辆 {driver.vehicle.code} 正在补油，暂停接收航班工单。完成后由调度人员确认恢复派工。</Alert>;
+    if (driver.vehicle?.status === 'REFUELLING') return <Alert severity="warning" variant="outlined">负责车辆 {driver.vehicle.code} 正在补油，暂停接收航班工单。请在现场补满油后确认完成。<Button disabled={submitting} onClick={() => { setActionError(''); setRefuelOpen(true); }}>确认补油完成</Button></Alert>;
     if (driver.work_status === 'ON_DUTY' && driver.vehicle) return <Alert severity="success" variant="outlined">当前状态：值班 · 负责车辆 {driver.vehicle.code}（{driver.vehicle.fuel_level.toLocaleString()} / {driver.vehicle.capacity.toLocaleString()} L）。</Alert>;
     if (driver.work_status === 'STANDBY') return <Alert severity="info" variant="outlined">当前状态：休闲候命 · 暂无车辆绑定。调度人员临时调用并绑定车辆后，这里会显示工单。</Alert>;
     return <Alert severity="warning" variant="outlined">当前状态：休息 · 暂无可执行工单。调度人员确认返岗后会安排候命或值班。</Alert>;
@@ -94,6 +104,11 @@ export default function DriverWorkspace() {
         </Stack>
       </Stack></Paper>;
     })}
+    <Dialog open={refuelOpen} onClose={() => !submitting && setRefuelOpen(false)} fullWidth maxWidth="xs">
+      <DialogTitle>确认补油完成 · {driver?.vehicle?.code}</DialogTitle>
+      <DialogContent><Stack spacing={2} sx={{ mt: 1 }}><Alert severity="warning">请确认已在现场补满油。提交后按车辆容量记录油量，并恢复调度。</Alert>{actionError && <Alert severity="error">{actionError}</Alert>}</Stack></DialogContent>
+      <DialogActions><Button disabled={submitting} onClick={() => setRefuelOpen(false)}>取消</Button><Button variant="contained" disabled={submitting} onClick={completeRefuel}>确认已补满</Button></DialogActions>
+    </Dialog>
     <Dialog open={Boolean(exceptionTask)} onClose={() => !submitting && setExceptionTask(null)} fullWidth maxWidth="xs">
       <DialogTitle>上报作业异常</DialogTitle><DialogContent><Stack spacing={2} sx={{ mt: 1 }}>
         <Alert severity="info">如本次已经加注，请通过“确认作业完成”登记实际量和差额。此处用于尚未加注的车辆故障。</Alert>

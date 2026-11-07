@@ -694,7 +694,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._resolve_alert(db, path.split("/")[3], payload, actor)
                     return
                 if path.startswith("/api/vehicles/") and path.endswith("/refuel"):
-                    dispatcher = self._authorize(db, "DISPATCHER")
+                    dispatcher = self._authorize(db, "DISPATCHER", "DRIVER")
                     self._refuel_vehicle(db, path.split("/")[3], payload, dispatcher)
                     return
                 if path == "/api/admin/flights/import":
@@ -1160,11 +1160,18 @@ class Handler(BaseHTTPRequestHandler):
         action = payload.get("action")
         if action not in {"start", "complete"}:
             raise ValueError("补油操作必须为 start 或 complete")
+        if action == "start" and dispatcher["role"] != "DISPATCHER":
+            raise PermissionError("只有调度人员可以安排补油")
+        if action == "complete" and (dispatcher["role"] != "DRIVER" or dispatcher["vehicle_id"] != vehicle_id or dispatcher["work_status"] != "ON_DUTY"):
+            raise PermissionError("只有负责该车的值班司机可以确认补油完成")
         active = self._active_vehicle_tasks(db, vehicle_id, "PENDING", "IN_PROGRESS", "AWAITING_REVIEW")
         if active:
             raise ValueError("该车辆名下有待执行或作业中工单，完成作业后才能补油")
         before = f"状态={vehicle['status']} 油量={vehicle['fuel_level']:,}/{vehicle['capacity']:,} L"
         if action == "start":
+            owner = db.execute("SELECT id FROM users WHERE vehicle_id=? AND role='DRIVER' AND account_status='ENABLED' AND work_status='ON_DUTY'", (vehicle_id,)).fetchone()
+            if not owner:
+                raise ValueError("请先为车辆绑定值班司机，再安排补油")
             if vehicle["status"] != "AVAILABLE":
                 raise ValueError("只有空闲可用车辆可以安排补油")
             if vehicle["fuel_level"] >= vehicle["capacity"]:
@@ -1188,8 +1195,8 @@ class Handler(BaseHTTPRequestHandler):
         log_operation(db, dispatcher, "确认补油完成", "加油车", vehicle_id, vehicle["code"],
                       before=before, after=f"状态=AVAILABLE 油量={vehicle['capacity']:,}/{vehicle['capacity']:,} L 位置={REFUEL_POINT['name']}")
         broadcast(db, "INFO", "加油车已完成补油", f"{vehicle['code']} 已在{REFUEL_POINT['name']}完成补油并重新参与调度。")
-        result = Scheduler.optimize(db)
-        self._send({"message": f"{vehicle['code']} 补油完成，已重新评估调度安排", **result, "overview": overview(db)})
+        Scheduler.optimize(db)
+        self._send({"message": f"{vehicle['code']} 补油完成，已重新评估调度安排", **self._driver_tasks(db, dispatcher)})
 
     @staticmethod
     def _resequence_tasks(db: sqlite3.Connection, task_id: str, requested_order: int) -> None:
@@ -1271,6 +1278,8 @@ class Handler(BaseHTTPRequestHandler):
                 existing = db.execute("SELECT * FROM flights WHERE flight_no=?", (flight_no,)).fetchone()
                 values = self._validated_flight(db, item, existing)
                 result["action"] = "UPDATE" if existing else "CREATE"
+                if datetime.fromisoformat(values["departure_at"]) < datetime.now(timezone.utc):
+                    result["warning"] = "离港时间已过：无活动工单的航班将归入历史计划，不会自动派工"
                 if not preview:
                     self._write_flight(db, values, existing["id"] if existing else None)
                     imported += 1
@@ -1417,8 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
         if active:
             raise ValueError("该人员名下有待执行或作业中工单，请先由调度人员完成交接后再停用")
         before = f"账号=ENABLED 状态={WORK_STATUSES.get(target['work_status']) or '无'} 车辆={target['vehicle_id'] or '无'}"
-        if target["vehicle_id"]:
-            db.execute("UPDATE vehicles SET driver='', updated_at=? WHERE id=?", (now(), target["vehicle_id"]))
+        self._unbind_vehicle(db, target)
         db.execute(
             "UPDATE users SET account_status='DISABLED', work_status='RESTING', vehicle_id=NULL WHERE id=?",
             (person_id,),
@@ -1447,6 +1455,9 @@ class Handler(BaseHTTPRequestHandler):
     def _unbind_vehicle(self, db: sqlite3.Connection, driver: sqlite3.Row) -> None:
         if not driver["vehicle_id"]:
             return
+        vehicle = db.execute("SELECT status FROM vehicles WHERE id=?", (driver["vehicle_id"],)).fetchone()
+        if vehicle and vehicle["status"] == "REFUELLING":
+            raise ValueError("负责车辆正在补油，请由当前司机确认完成后再交接")
         db.execute("UPDATE users SET vehicle_id=NULL WHERE id=?", (driver["id"],))
         db.execute("UPDATE vehicles SET driver='', updated_at=? WHERE id=?", (now(), driver["vehicle_id"]))
 
@@ -1502,8 +1513,7 @@ class Handler(BaseHTTPRequestHandler):
         if driver["work_status"] == "RESTING":
             raise ValueError("休息人员不能临时调用，请先将人员调整为休闲候命")
         vehicle = self._free_vehicle(db, payload.get("vehicleId"))
-        if vehicle["fuel_level"] * 5 < vehicle["capacity"]:
-            raise ValueError("该车辆油量低于安全阈值，请先安排补油后再临时调用")
+
         try:
             db.execute(
                 "UPDATE users SET vehicle_id=?, work_status='ON_DUTY' WHERE id=?",
@@ -1528,7 +1538,7 @@ class Handler(BaseHTTPRequestHandler):
             db, """SELECT t.id, f.x, f.y, COALESCE(t.fuel_requested,f.fuel_needed) fuel_needed FROM tasks t JOIN flights f ON f.id=t.flight_id
                     WHERE t.vehicle_id=? AND t.state='PENDING'""", (driver["vehicle_id"],),
         )
-        if new_vehicle["fuel_level"] < sum(task["fuel_needed"] for task in pending) or new_vehicle["fuel_level"] * 5 < new_vehicle["capacity"]:
+        if pending and (new_vehicle["fuel_level"] < sum(task["fuel_needed"] for task in pending) or new_vehicle["fuel_level"] * 5 < new_vehicle["capacity"]):
             raise ValueError("新车辆油量不足以承接全部待执行工单，或低于安全阈值，请先安排补油")
         old_vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["vehicle_id"],)).fetchone()
         old_code = self._bound_vehicle_code(db, driver["vehicle_id"])
